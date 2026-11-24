@@ -152,7 +152,10 @@ def build_record(cfg: dict, prov, eff_vars: dict, store_secrets: bool) -> dict |
     mount_cmd = None
     if ips and cfg.get("mount"):
         try:
-            mctx = {**ctx, "client": {"vip": ips[0], "name": "<client>", "host": "<client>"}}
+            mctx = {**ctx, "client": {"vip": ips[0], "name": "<client>", "host": "<client>"},
+                    "tenant_vip": {"start": ips[0], "end": ips[-1]}}   # for multipath mounts (remoteports=start-end)
+            if isinstance(o.get("view"), dict) and o["view"].get("path"):   # mount the view that was actually created
+                mctx["vars"] = {**mctx.get("vars", {}), "view_path": o["view"]["path"]}
             mount_cmd = render_section(cfg["mount"], mctx, "mount").get("command")
         except TemplateError:
             pass

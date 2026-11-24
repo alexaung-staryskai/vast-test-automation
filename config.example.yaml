@@ -235,8 +235,10 @@ provisioning:
         flavor: "${vars.view_policy_flavor}"
         permission_per_vip_pool: { "${vippool.id}": RW }   # VMS 5.5 binds VIP pools this way
         nfs_read_write: ["*"]
-        nfs_root_squash: ["*"]       # VMS needs at least one squash entry
-        nfs_no_squash: []
+        # test clients run benchmarks with sudo: root acts as root on the view (no squash). With root squash
+        # and the NFS flavor, the view's top folder (755) is not writable and elbencho fails with "Permission denied".
+        nfs_root_squash: []
+        nfs_no_squash: ["*"]         # VMS needs at least one squash entry
         s3_read_write: ["*"]
       verify:
         endpoint: /viewpolicies/${view_policy.id}/
@@ -292,16 +294,19 @@ clients:
 mount:
   mount_point: /mnt/vast
   export_path: "${vars.view_path}"
-  vip: auto                 # auto = spread clients round-robin over the tenant's VIP pool IPs; or a fixed IP
-  # nconnect needs Linux kernel >= 5.3. With the VAST NFS driver (vastnfs) you can add multipath:
-  #   remoteports=<first VIP>-<last VIP>,spread_reads,spread_writes
-  options: vers=3,proto=tcp,nconnect=16,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noatime,nodiratime,lookupcache=positive
-  command: mount -t nfs -o ${mount.options} ${client.vip}:${mount.export_path} ${mount.mount_point}
+  vip: auto                 # only used by commands that reference ${client.vip}; the mount below uses the tenant VIP pool
+  # Default: NFSv3 over TCP with VAST multipath across the whole tenant VIP pool. Needs the VAST NFS driver on the
+  # client (vastnfs - "Install missing" in Required packages builds it; reboot to load). The stock Linux NFS client
+  # rejects remoteports/spread_* ("incorrect mount option"). For RDMA NICs use proto=rdma,port=20049 instead of proto=tcp.
+  #   ${tenant_vip.start} / ${tenant_vip.end} = the VIP pool this site's onboarding created; ${mount.export_path} = its view.
+  # Presets add sudo automatically when the SSH user is not root (ssh.use_sudo: auto).
+  options: proto=tcp,vers=3,nconnect=8,remoteports=${tenant_vip.start}-${tenant_vip.end},spread_reads,spread_writes
+  command: mount -o ${mount.options} ${tenant_vip.start}:${mount.export_path} ${mount.mount_point}
   read_ahead_kb: 16384
   read_ahead_command: 'DEV=$(mountpoint -d ${mount.mount_point}) && echo ${mount.read_ahead_kb} > /sys/class/bdi/$DEV/read_ahead_kb && echo "read_ahead_kb for $DEV = $(cat /sys/class/bdi/$DEV/read_ahead_kb)"'
 
 # ---------------------------------------------------------------------
-# elbencho benchmark (Tab 2 -> Elbencho Write / Elbencho Read / Elbencho Auto Read/Write / Perf Test)
+# elbencho benchmark (Tab 2 -> Elbencho Write / Elbencho Read / Elbencho Auto Read/Write)
 # Commands use these as ${elbencho.…}, like ${mount.…}. Data written per client by Write =
 #   threads x dirs x files x file_size   (defaults: 32 x 1 x 8 x 4g = 1 TiB per client)
 # ---------------------------------------------------------------------
@@ -320,19 +325,8 @@ elbencho:
   write_command: 'elbencho --nolive -w -d ${elbencho.options} "${elbencho.dir}"'
   read_command: 'elbencho --nolive -r ${elbencho.options} "${elbencho.dir}"'
   cleanup_command: 'elbencho --nolive -F -D -t ${elbencho.threads} -n ${elbencho.dirs} -N ${elbencho.files} "${elbencho.dir}"'
-  # Perf Test extras: random small-block IOPS on the written files, then a small-file metadata test
-  rand_block_size: 4k      # I/O size for the random write/read phases
-  rand_seconds: 60         # time limit for each random phase
-  rand_write_command: 'elbencho --nolive -w --rand -t ${elbencho.threads} -n ${elbencho.dirs} -N ${elbencho.files} -s ${elbencho.file_size} -b ${elbencho.rand_block_size} --direct --timelimit ${elbencho.rand_seconds} "${elbencho.dir}"'
-  rand_read_command: 'elbencho --nolive -r --rand -t ${elbencho.threads} -n ${elbencho.dirs} -N ${elbencho.files} -s ${elbencho.file_size} -b ${elbencho.rand_block_size} --direct --timelimit ${elbencho.rand_seconds} "${elbencho.dir}"'
-  md_dirs: 10              # metadata test: directories per thread
-  md_files: 1000           # metadata test: empty files per directory
-  md_options: "-t ${elbencho.threads} -n ${elbencho.md_dirs} -N ${elbencho.md_files}"
-  md_create_command: 'mkdir -p "${elbencho.dir}/md" && elbencho --nolive -d -w -s 0 ${elbencho.md_options} "${elbencho.dir}/md"'
-  md_stat_command: 'elbencho --nolive --stat ${elbencho.md_options} "${elbencho.dir}/md"'
-  md_delete_command: 'elbencho --nolive -F -D ${elbencho.md_options} "${elbencho.dir}/md" && rmdir "${elbencho.dir}/md"'
 
-  # Delete Perf Test Files: the client's whole benchmark folder (only inside <mount point>/elbencho/)
+  # Delete Elbencho Files: the client's whole benchmark folder (only inside <mount point>/elbencho/)
   delete_command: 'case "${elbencho.dir}" in "${mount.mount_point}"/elbencho/?*) ;; *) echo "refusing to delete ${elbencho.dir}: not inside ${mount.mount_point}/elbencho/"; exit 1;; esac; if [ -d "${elbencho.dir}" ]; then echo "deleting ${elbencho.dir} ($(du -sh "${elbencho.dir}" | cut -f1))"; rm -rf -- "${elbencho.dir}" && echo "deleted"; else echo "nothing to delete: ${elbencho.dir} does not exist"; fi'
   # Clear Linux Cache: flush dirty pages, then drop the page cache, dentries and inodes (needs root; presets use sudo)
   drop_caches_command: 'echo "before:"; free -h | head -2; sync && echo 3 > /proc/sys/vm/drop_caches && echo "page cache, dentries and inodes dropped"; echo "after:"; free -h | head -2'
@@ -448,6 +442,39 @@ command_groups:
       - uname -r
       - cat /etc/os-release | head -2
 
+  - id: client_info
+    label: Client Info
+    sudo: false
+    commands:                 # read-only: OS, kernel, VAST NFS driver, CPU, RAM, network speed and IPs
+      - display: show OS, kernel, VAST NFS driver, CPU, RAM, network speed and IP addresses
+        run: |
+          . /etc/os-release 2>/dev/null
+          echo "OS:               ${NAME:-unknown}"
+          echo "OS version:       ${VERSION_ID:-?}  (${PRETTY_NAME:-?})"
+          echo "Kernel:           $(uname -r)"
+          F=/sys/module/sunrpc/parameters/nfs_bundle_version
+          if [ -r "$F" ]; then D="VAST NFS $(cat "$F") (loaded)"
+          else
+            P=$(dpkg-query -W -f='${Version}\n' 'vastnfs*' 2>/dev/null | grep -v '^$' | head -1)
+            [ -z "$P" ] && P=$(rpm -q --qf '%{VERSION}' vastnfs 2>/dev/null | grep -v 'not installed')
+            D="not loaded - stock kernel NFS client${P:+ (installed: $P - reboot to load)}"
+          fi
+          echo "VAST NFS driver:  $D"
+          MODEL=$(lscpu 2>/dev/null | sed -n 's/^Model name:[[:space:]]*//p' | head -1)
+          echo "CPUs:             $(nproc)${MODEL:+  ($MODEL)}"
+          echo "RAM:              $(awk '/^MemTotal/ {printf "%.1f GiB", $2/1048576}' /proc/meminfo)"
+          echo "Network:"
+          for i in $(ls /sys/class/net); do
+            [ "$i" = lo ] && continue
+            [ -e "/sys/class/net/$i/device" ] || continue      # real (incl. virtual-machine) NICs; skips docker, bridges, veth
+            S=$(cat "/sys/class/net/$i/speed" 2>/dev/null)
+            if [ -n "$S" ] && [ "$S" -gt 0 ] 2>/dev/null; then
+              if [ "$S" -ge 1000 ]; then SPEED="$((S / 1000)) Gb/s"; else SPEED="$S Mb/s"; fi
+            else SPEED="speed n/a (virtual NIC)"; fi
+            IPS=$(ip -4 -o addr show dev "$i" 2>/dev/null | awk '{print $4}' | paste -sd, -)
+            echo "  $i: ${IPS:-no IPv4}  ·  $SPEED  ·  $(cat "/sys/class/net/$i/operstate")  ·  mtu $(cat "/sys/class/net/$i/mtu")"
+          done
+
   - id: vastnfs_version
     label: Check VAST driver version
     section: packages          # shown next to Check packages / Install missing / Update
@@ -483,9 +510,33 @@ command_groups:
   - id: mount
     label: Mount NFSv3
     commands:
+      # a stale or previous mount here (e.g. of a view that was deleted) blocks everything with "Stale file handle":
+      # unmount it first (forced, or lazy if the server side is gone)
+      - 'if grep -qs " ${mount.mount_point} " /proc/mounts; then echo "${mount.mount_point} is still mounted (a previous or deleted view) - unmounting it first"; umount -f "${mount.mount_point}" 2>/dev/null || umount -l "${mount.mount_point}"; fi'
       - mkdir -p ${mount.mount_point}
       - ${mount.command}
       - mount | grep " ${mount.mount_point} "
+
+  - id: mount_status
+    label: Mount Status
+    sudo: false
+    commands:                 # read-only: what is mounted at the mount point, is it this site's view, does it respond
+      - display: check the mount at ${mount.mount_point}
+        run: |
+          M="${mount.mount_point}"
+          if ! grep -qs " $M " /proc/mounts; then echo "RESULT: NOT MOUNTED - nothing is mounted at $M (run Mount NFSv3)"; exit 1; fi
+          SRC=$(grep " $M " /proc/mounts | awk '{print $1}' | tail -1)
+          grep " $M " /proc/mounts | tail -1 | awk '{print "source:   "$1; print "type:     "$3; print "options:  "$4}'
+          case "$SRC" in
+            *:"${mount.export_path}") echo "view:     this site's tenant view (${mount.export_path})" ;;
+            *) echo "WARNING:  a different view is mounted - this site's tenant view is ${mount.export_path}" ;;
+          esac
+          if timeout 5 stat -t "$M" >/dev/null 2>&1; then
+            df -h "$M" | tail -1 | awk '{print "usage:    "$3" used of "$2" ("$5"), "$4" free"}'
+            echo "RESULT: mounted and responding"
+          else
+            echo "RESULT: mounted but NOT responding (stale file handle or VIP unreachable) - run Mount NFSv3 to remount"; exit 1
+          fi
 
   - id: readahead
     label: Set read-ahead
@@ -518,26 +569,10 @@ command_groups:
       - ${elbencho.read_command}
       - ${elbencho.cleanup_command}
 
-  - id: perf_test
-    label: Perf Test
-    results: true
-    delay_between_commands_seconds: 5
-    commands:                 # throughput, random IOPS, metadata, then delete everything it wrote
-      - ${elbencho.check_mount}
-      - ${elbencho.mkdir_command}
-      - ${elbencho.write_command}
-      - ${elbencho.read_command}
-      - ${elbencho.rand_write_command}
-      - ${elbencho.rand_read_command}
-      - ${elbencho.cleanup_command}
-      - ${elbencho.md_create_command}
-      - ${elbencho.md_stat_command}
-      - ${elbencho.md_delete_command}
-
   - id: elbencho_delete
-    label: Delete Perf Test Files
+    label: Delete Elbencho Files
     results: false
-    confirm: Deletes all elbencho / Perf Test files of the ticked clients on the VAST view (each client's folder under <mount point>/elbencho/). This cannot be undone.
+    confirm: Deletes all elbencho files of the ticked clients on the VAST view (each client's folder under <mount point>/elbencho/). This cannot be undone.
     commands:
       - ${elbencho.check_mount}
       - ${elbencho.delete_command}
@@ -550,4 +585,4 @@ command_groups:
   - id: unmount
     label: Unmount
     commands:
-      - umount ${mount.mount_point}
+      - 'umount "${mount.mount_point}" 2>/dev/null || umount -f "${mount.mount_point}" 2>/dev/null || umount -l "${mount.mount_point}"'   # normal, then forced, then lazy (stale mounts)

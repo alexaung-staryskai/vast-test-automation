@@ -113,6 +113,7 @@ function showTab(id) {
   if (id === "t3" && !cfgEdit.loaded) loadRawConfig();
   if (id === "t0") renderSites();
   if (id === "t5") { loadResults(); requestAnimationFrame(fitLogsSplit); }
+  if (id === "t6" && typeof openChartTab === "function") openChartTab();
   store.set("tab", id);
 }
 $$(".tab").forEach((t) => t.addEventListener("click", () => showTab(t.dataset.tab)));
@@ -249,61 +250,103 @@ const VAR_GROUPS = [
   { title: "View Policy", icon: "🛡", steps: ["view_policy"], keys: ["view_policy_name", "view_policy_flavor"] },
   { title: "View", icon: "📂", steps: ["view"], keys: ["view_name", "view_path", "view_protocols", "bucket_name"] },
 ];
-const VAR_LABELS = {
-  tenant_name: "Tenant name", tenant_admin_username: "Tenant admin username", tenant_admin_password: "Tenant admin password",
-  tenant_admin_role: "Tenant admin role", s3_user_name: "S3 user name", vip_pool_name: "VIP pool name",
+const VAR_LABELS = {   // short: the card title already says what object it is
+  tenant_name: "Tenant name", tenant_admin_username: "Admin username", tenant_admin_password: "Admin password",
+  tenant_admin_role: "Admin role", s3_user_name: "S3 user", vip_pool_name: "Pool name",
   quota_name: "Quota name", quota_hard_limit: "Hard limit", quota_soft_limit: "Soft limit",
-  qos_name: "QoS policy name", qos_read_limit: "Read bandwidth", qos_write_limit: "Write bandwidth",
-  view_policy_name: "View policy name", view_policy_flavor: "Flavor", view_name: "View name",
-  view_path: "View path", view_protocols: "Protocols", bucket_name: "S3 bucket name",
+  qos_name: "Policy name", qos_read_limit: "Read limit", qos_write_limit: "Write limit",
+  view_policy_name: "Policy name", view_policy_flavor: "Security flavor", view_name: "View name",
+  view_path: "Path", view_protocols: "Protocols", bucket_name: "S3 bucket",
 };
 // view policy security flavors: VMS API value -> label shown in the VMS UI (same order as VMS)
 const FLAVORS = { NFS: "NFS", SMB: "SMB", S3_NATIVE: "S3 Native", BLOCK: "Block", MIXED_LAST_WINS: "Mixed Last Wins" };
 const PROTOCOLS = ["NFS", "S3"];
 
+// Short help shown next to a label (instead of conversion text under every field)
+const VAR_NOTES = {
+  tenant_admin_password: "empty = auto-generated",
+  quota_soft_limit: "0 = none",
+  qos_read_limit: "0 = unlimited · min 100 MB/s",
+  qos_write_limit: "0 = unlimited · min 100 MB/s",
+};
+const isTemplate = (v) => typeof v === "string" && v.includes("${");
+const NAME_KEYS = new Set(["tenant_admin_username", "tenant_admin_role", "s3_user_name", "vip_pool_name", "quota_name",
+  "qos_name", "view_policy_name", "view_name", "view_path", "bucket_name"]);
+
+/* One settings row: label (+ short note) on the left, the control on the right.
+   Names built from the tenant name show only the real name; ✎ reveals the template to customise it. */
 function varField(k, v) {
   const secret = /password|secret|token/i.test(k);
-  const lab = document.createElement("label");
-  lab.className = "f-field";
-  lab.dataset.key = k;
-  lab.title = `vars.${k}`;
-  const label = esc(VAR_LABELS[k] || k);
+  const row = document.createElement("div");
+  row.className = "vrow";
+  row.dataset.key = k;
+  row.title = `vars.${k}`;
+  const note = VAR_NOTES[k] ? `<small class="vnote">${esc(VAR_NOTES[k])}</small>` : "";
+  row.innerHTML = `<div class="vlabel">${esc(VAR_LABELS[k] || k)}${note}</div><div class="vctl"></div>`;
+  const ctl = row.querySelector(".vctl");
   const save = async (val) => {
     const r = await api("PUT", "/api/vars", { vars: { [k]: val } }).catch((err) => alert(err.message));
     if (r) { CFG.vars = r.vars; CFG.resolved_vars = r.resolved_vars; updateVarHints(); }
   };
   const unit = unitControl(v, save);
   if (unit) {
-    lab.innerHTML = label;
-    lab.appendChild(unit);
+    ctl.appendChild(unit);
   } else if (k === "view_policy_flavor" && v in FLAVORS) {
-    lab.innerHTML = `${label}<select>${Object.entries(FLAVORS).map(([val, text]) =>
+    ctl.innerHTML = `<select>${Object.entries(FLAVORS).map(([val, text]) =>
       `<option value="${val}" ${val === v ? "selected" : ""}>${text}</option>`).join("")}</select>`;
-    lab.querySelector("select").onchange = (e) => save(e.target.value);
+    ctl.querySelector("select").onchange = (e) => save(e.target.value);
   } else if (k === "view_protocols" && Array.isArray(v)) {
-    lab.innerHTML = `${label}<span class="checks">${PROTOCOLS.map((p) =>
+    ctl.innerHTML = `<span class="checks">${PROTOCOLS.map((p) =>
       `<label><input type="checkbox" value="${p}" ${v.includes(p) ? "checked" : ""}> ${p}</label>`).join("")}</span>`;
-    lab.querySelectorAll("input").forEach((cb) => (cb.onchange = () => {
-      const sel = [...lab.querySelectorAll("input:checked")].map((x) => x.value);
+    ctl.querySelectorAll("input").forEach((cb) => (cb.onchange = () => {
+      const sel = [...ctl.querySelectorAll("input:checked")].map((x) => x.value);
       if (!sel.length) { cb.checked = true; return alert("Pick at least one protocol"); }
       save(JSON.stringify(sel));
     }));
+  } else if (!secret && (isTemplate(v) || NAME_KEYS.has(k))) {
+    // read view: the real name; edit view: the template (e.g. ${vars.tenant_name}-admin)
+    ctl.innerHTML = `<div class="vname"><span class="vtext mono"></span><span class="vtag" hidden>custom</span>
+        <button type="button" class="icon-btn" data-edit title="Customise this name">✎</button></div>
+      <div class="vedit" hidden><input type="text" spellcheck="false" value="${esc(v)}">
+        <small class="vnote">Use <code>\${vars.tenant_name}</code> to follow the tenant name · Enter to apply, Esc to cancel</small></div>`;
+    const view = ctl.querySelector(".vname"), edit = ctl.querySelector(".vedit"), inp = edit.querySelector("input");
+    const close = () => { edit.hidden = true; view.hidden = false; };
+    ctl.querySelector("[data-edit]").onclick = () => { view.hidden = true; edit.hidden = false; inp.value = CFG.vars[k]; inp.focus(); inp.select(); };
+    inp.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); inp.blur(); }
+      if (e.key === "Escape") { inp.value = CFG.vars[k]; close(); }
+    });
+    inp.addEventListener("blur", async () => { if (inp.value !== CFG.vars[k]) await save(inp.value); close(); });
   } else {
     const shown = typeof v === "object" && v !== null ? JSON.stringify(v) : v;
-    lab.innerHTML = `${label}<input type="${secret ? "password" : "text"}" value="${esc(shown)}"
-      placeholder="${secret ? "empty = generate" : ""}">`;
-    lab.querySelector("input").addEventListener("change", (e) => save(e.target.value));
+    ctl.innerHTML = `<input type="${secret ? "password" : "text"}" value="${esc(shown)}" placeholder="${secret ? "auto-generated" : ""}">`;
+    ctl.querySelector("input").addEventListener("change", (e) => save(e.target.value));
   }
-  lab.insertAdjacentHTML("beforeend", '<span class="hint"></span>');
-  return lab;
+  ctl.insertAdjacentHTML("beforeend", '<div class="vwarn" hidden></div>');
+  return row;
 }
 
 function renderVars() {
   const box = $("#vars");
   $("#vipHolder").append($("#vipSettings"), $("#vipPick"), $("#vipSettingsMsg")); // keep the VIP form alive across re-renders
   box.innerHTML = "";
-  const used = new Set();
-  const groups = [...VAR_GROUPS];
+  // 1) the tenant name: the one value most tests change; everything else is named after it
+  if ("tenant_name" in CFG.vars) {
+    const hero = document.createElement("section");
+    hero.className = "tenant-hero";
+    hero.dataset.steps = "tenant";
+    hero.innerHTML = `<div class="hero-main"></div>
+      <div class="hero-side"><span class="vbox-status"></span>
+        <span class="muted small">The admin, VIP pool, quota, QoS policy, view policy and view are named after it.</span></div>`;
+    const f = varField("tenant_name", CFG.vars.tenant_name);
+    f.classList.add("hero-field");
+    hero.querySelector(".hero-main").appendChild(f);
+    box.appendChild(hero);
+  }
+  // 2) one card per object, in onboarding order
+  const grid = document.createElement("div");
+  grid.className = "vargroups";
+  const groups = VAR_GROUPS.filter((g) => !g.keys.includes("tenant_name"));
   const others = Object.keys(CFG.vars).filter((k) => !VAR_GROUPS.some((g) => g.keys.includes(k)));
   if (others.length) groups.push({ title: "Other", icon: "⋯", steps: [], keys: others });
   for (const g of groups) {
@@ -312,25 +355,32 @@ function renderVars() {
     const sec = document.createElement("section");
     sec.className = "vbox";
     sec.dataset.steps = g.steps.join(",");
-    sec.innerHTML = `<div class="vbox-head"><h3>${g.icon} ${esc(g.title)}</h3><span class="vbox-status"></span></div><div class="vbox-body"></div>`;
+    sec.innerHTML = `<div class="vbox-head"><h3><span class="vbox-icon" aria-hidden="true">${g.icon}</span>${esc(g.title)}</h3><span class="vbox-status"></span></div><div class="vbox-body"></div>`;
     const body = sec.querySelector(".vbox-body");
-    for (const k of keys) { body.appendChild(varField(k, CFG.vars[k])); used.add(k); }
+    for (const k of keys) body.appendChild(varField(k, CFG.vars[k]));
     if (g.vip) body.append($("#vipSettings"), $("#vipPick"), $("#vipSettingsMsg"));
-    box.appendChild(sec);
+    grid.appendChild(sec);
   }
+  box.appendChild(grid);
   updateVarHints();
   updateGroupStatus();
 }
 
+// Plain-language status per object: not created / 2 of 4 created / created / failed / running
 function updateGroupStatus() {
-  $$("#vars .vbox").forEach((sec) => {
+  $$("#vars [data-steps]").forEach((sec) => {
     const steps = (sec.dataset.steps || "").split(",").filter(Boolean);
-    const st = steps.map((s) => provResults[s]?.status || "pending");
     const el = sec.querySelector(".vbox-status");
+    if (!el) return;
     if (!steps.length) { el.innerHTML = ""; return; }
-    const worst = ["failed", "running", "pending", "skipped", "reused", "passed"].find((x) => st.includes(x));
+    const st = steps.map((s) => provResults[s]?.status || "pending");
     const done = st.filter((x) => x === "passed" || x === "reused").length;
-    el.innerHTML = `<span class="pill ${worst}" title="${steps.map((s, i) => `${s}: ${st[i]}`).join("\n")}">${done}/${steps.length} ${worst === "passed" || worst === "reused" ? "done" : worst}</span>`;
+    const [cls, text] = st.includes("failed") ? ["bad", "✕ failed"]
+      : st.includes("running") ? ["run", "… running"]
+      : done === steps.length ? ["ok", "✓ created"]
+      : done ? ["part", `${done} of ${steps.length} created`]
+      : ["none", "not created yet"];
+    el.innerHTML = `<span class="status-chip ${cls}" title="${esc(steps.map((s, i) => `${s}: ${st[i]}`).join("\n"))}">${text}</span>`;
   });
 }
 
@@ -342,15 +392,22 @@ $("#varsSave").onclick = (e) => busy(e.target, async () => {
     (r.backup ? ` <span class="muted">Backup <code>${esc(r.backup)}</code></span>` : "");
 });
 function updateVarHints() {
-  $$("#vars label[data-key]").forEach((lab) => {
-    const k = lab.dataset.key;
+  $$("#vars .vrow[data-key]").forEach((row) => {
+    const k = row.dataset.key;
     const raw = CFG.vars[k], res = CFG.resolved_vars?.[k];
-    const hintEl = lab.querySelector(".hint");
+    const text = row.querySelector(".vtext");
+    if (text) {   // a name: show the real one, mark it if it no longer follows the tenant name
+      const shown = typeof res === "object" ? JSON.stringify(res) : String(res ?? raw ?? "");
+      text.textContent = shown;
+      text.title = isTemplate(raw) ? `${shown}\n(template: ${raw})` : shown;
+      row.querySelector(".vtag").hidden = isTemplate(raw);
+    }
+    const warn = row.querySelector(".vwarn");
     const u = unitHint(k);
-    hintEl.classList.toggle("err", !!u?.bad);
-    if (u) { hintEl.textContent = u.text; return; }
-    const showHint = typeof raw === "string" && raw.includes("${") && !/password/i.test(k);
-    hintEl.textContent = showHint ? "→ " + (typeof res === "object" ? JSON.stringify(res) : res) : "";
+    warn.hidden = !u?.bad;   // conversions only matter when they are a problem (e.g. below the VMS minimum)
+    warn.textContent = u?.bad ? u.text : "";
+    const unit = row.querySelector(".unit");
+    if (unit) unit.title = u ? u.text.replace(/^= /, "Sent to the VMS as ") : "";
   });
 }
 
@@ -397,10 +454,14 @@ function renderVip() {
   // one block per /24 (x.x.x.0 - .255), 32 IPs per row, row label = first octet of the row
   const cellHtml = (c) => {
     const last = c.ip.split(".").pop();
+    const blk = c.state === "free" ? vipBlockFor(c.ip) : null;
+    const nofit = c.state === "free" && !blk;   // free, but in a run shorter than the block size
     const what = c.holder ? c.holder
       : c.state === "proposed" ? "proposed"
-      : c.state === "outside" ? "outside the candidate ranges (vip_pool.ranges)" : "free";
-    return `<button class="ip ${c.state}${c.holder === "answers ping" ? " ping" : ""}${c.in_range === false ? " out" : ""}" data-ip="${c.ip}"
+      : c.state === "outside" ? "outside the candidate ranges (vip_pool.ranges)"
+      : nofit ? `free, but fewer than ${d.ip_count} free IPs in a row here - can't hold a block`
+      : `free - click to choose ${n2ip(blk[0])} – ${n2ip(blk[1])}`;
+    return `<button class="ip ${c.state}${nofit ? " nofit" : ""}${c.holder === "answers ping" ? " ping" : ""}${c.in_range === false ? " out" : ""}" data-ip="${c.ip}"
       title="${esc(c.ip)} — ${esc(what)}">${last}</button>`;
   };
   const nets = [];
@@ -418,7 +479,8 @@ function renderVip() {
     <div class="proposal">${p ? `${d.auto === false ? "Chosen" : "Auto-selected"} VIP range: <b>${esc(p.start)} – ${esc(p.end)}</b> (${p.count} IPs)`
       : d.auto === false ? `<span class="warn-note">No range chosen yet. Click a free IP to start a block of ${d.ip_count} there.</span>`
       : `<span class="err">No block of ${d.ip_count} free consecutive IPs in the candidate ranges.</span>`}</div>
-    <div class="legend"><span><i style="background:var(--ip-free)"></i>free</span><span><i style="background:var(--ip-prop)"></i>${d.auto === false ? "chosen" : "proposed"}</span>
+    <div class="legend"><span><i style="background:var(--ip-free)"></i>free (click: the block of ${d.ip_count} around it)</span>
+      <span><i class="nofit-swatch"></i>free, gap too small</span><span><i style="background:var(--ip-prop)"></i>${d.auto === false ? "chosen" : "proposed"}</span>
       <span><i style="background:var(--ip-used)"></i>used (VIP pool / compute cluster)</span><span><i style="background:var(--ip-ping)"></i>answers ping</span>
       <span><i class="out-swatch"></i>outside candidate ranges</span></div>
     <div class="vipmap">${cells}</div>
@@ -435,11 +497,37 @@ $("#vipClear").onclick = (e) => busy(e.target, async () => {
   vipData = await api("POST", "/api/vip/check");
   renderVip(); renderVipPick();
 });
+// The block a click on `ip` chooses: inside a free run that is big enough, the block containing the IP
+// (near the end of the run it starts earlier). null = the IP is in a gap too small for a block.
+const ip2n = (ip) => ip.split(".").reduce((a, o) => a * 256 + Number(o), 0);
+const n2ip = (n) => [n >>> 24, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join(".");
+function vipBlockFor(ip) {
+  if (!vipData) return null;
+  const n = ip2n(ip), size = vipData.ip_count;
+  const run = (vipData.free_blocks || []).map((b) => [ip2n(b.start), ip2n(b.end)]).find(([a, b]) => a <= n && n <= b && b - a + 1 >= size);
+  if (!run) return null;
+  const start = Math.min(n, run[1] - size + 1);
+  return [start, start + size - 1];
+}
+function vipPreview(ip) {
+  $$("#vipMap .ip.preview").forEach((x) => x.classList.remove("preview"));
+  const blk = ip && vipBlockFor(ip);
+  if (!blk) return;
+  $$("#vipMap .ip").forEach((x) => { const n = ip2n(x.dataset.ip); if (n >= blk[0] && n <= blk[1]) x.classList.add("preview"); });
+}
+$("#vipMap").addEventListener("mouseover", (e) => vipPreview(e.target.closest(".ip.free")?.dataset.ip));
+$("#vipMap").addEventListener("mouseleave", () => vipPreview(null));
 $("#vipMap").addEventListener("click", async (e) => {
-  const ip = e.target.dataset?.ip;
-  if (!ip || e.target.classList.contains("used") || e.target.classList.contains("outside")) return;
+  const cell = e.target.closest(".ip");
+  const ip = cell?.dataset.ip;
+  if (!ip || cell.classList.contains("used") || cell.classList.contains("outside")) return;
+  if (cell.classList.contains("nofit")) {
+    toast(`${ip} is free, but there aren't ${vipData.ip_count} free IPs in a row there. Pick an IP in one of the bright green runs.`, "err", 6000);
+    return;
+  }
+  const blk = vipBlockFor(ip);
   try {
-    vipData = await api("POST", "/api/vip/select", { start: ip }); // the server switches to manual selection
+    vipData = await api("POST", "/api/vip/select", { start: blk ? n2ip(blk[0]) : ip }); // the server switches to manual selection
     $("#vipSettings").auto_select.checked = false;
     renderVip(); renderVipPick();
   } catch (err) { alert(err.message); }
@@ -532,7 +620,7 @@ async function refreshProvision() {
   renderSteps();
 }
 
-/* ---- live progress while "Run all" is going: poll the server's per-step state ---- */
+/* ---- live progress while "Create Tenant" (all steps) is going: poll the server's per-step state ---- */
 function elapsed(iso) {
   const t = Date.parse(iso || "");
   return Number.isNaN(t) ? "" : `${Math.max(0, (Date.now() - t) / 1000).toFixed(1)}s…`;
@@ -982,8 +1070,7 @@ function elbenchoInfo(e) {
   const per = elbSize(e.file_size) * Number(e.threads) * Number(e.dirs || 1) * Number(e.files || 1);
   const clients = Math.max(1, selectedIds().length);
   return `<b>Benchmark</b><span><span class="mono">${esc(e.threads)} threads × ${esc(e.dirs)} dir × ${esc(e.files)} files × ${esc(e.file_size)}</span>
-      · block ${esc(e.block_size)} ${esc(e.flags || "")}${Number.isFinite(per) ? ` · <b>${fmtBytes(per)} per client</b>${clients > 1 ? ` (${fmtBytes(per * clients)} for ${clients} ticked consoles)` : ""}` : ""}</span>
-    <b>Perf Test</b><span>+ random ${esc(e.rand_block_size)} write/read for ${esc(e.rand_seconds)} s each · metadata ${esc(e.threads)} × ${esc(e.md_dirs)} dirs × ${esc(e.md_files)} empty files</span>`;
+      · block ${esc(e.block_size)} ${esc(e.flags || "")}${Number.isFinite(per) ? ` · <b>${fmtBytes(per)} per client</b>${clients > 1 ? ` (${fmtBytes(per * clients)} for ${clients} ticked consoles)` : ""}` : ""}</span>`;
 }
 function renderPresets() {
   const m = CFG.mount || {};
@@ -1024,11 +1111,18 @@ $("#presets").addEventListener("click", async (e) => {
   try { await startRun("/api/runs", { group: gid, session_ids: selectedIds() }, g.label); } catch (err) { alert(err.message); }
 });
 
+// The status list shows only the latest run (plus any still running on other consoles);
+// older runs are in the 🗒 Logs tab.
+function pruneRunStatus(keep) {
+  $$("#runStatus > div").forEach((x) => { if (x !== keep && !x.classList.contains("is-running")) x.remove(); });
+}
 function trackRun(runId, label, onDone) {
   const line = document.createElement("div");
+  line.className = "is-running";
   const n = () => `<span class="muted small">${esc(runId)}</span>`;
   line.innerHTML = `<span class="pill running">running</span> ${esc(label)} · ${n()}`;
   $("#runStatus").prepend(line);
+  pruneRunStatus(line);
   const poll = async () => {
     const run = await api("GET", `/api/runs/${runId}`).catch(() => null);
     if (!run) return setTimeout(poll, 2000);
@@ -1039,8 +1133,14 @@ function trackRun(runId, label, onDone) {
       return setTimeout(poll, 1500);
     }
     const links = (run.files || []).map((f) => `<a href="/api/results/${encodeURIComponent(f)}">${esc(f)}</a>`).join(" · ");
-    line.innerHTML = `<span class="pill ${run.status}">${run.status}</span> ${esc(label)} on ${run.clients.length} client(s) · ${links}`;
+    line.innerHTML = `<span class="pill ${run.status}">${run.status}</span> ${esc(label)} on ${run.clients.length} client(s) · ${links}` +
+      ` · <a href="#" data-goto="t5" class="small">earlier runs in 🗒 Logs</a>`;
+    line.classList.remove("is-running");
+    // keep this finished line only if it is the newest one; otherwise a newer run already took its place
+    if ($("#runStatus").firstElementChild !== line) line.remove();
+    else pruneRunStatus(line);
     if (run.summary) renderSummary(run);
+    if (run.summary && $("#t6")?.classList.contains("active")) loadResults().then(() => loadChart());
     loadResults();
     if (onDone) onDone(run);
   };
@@ -1083,7 +1183,7 @@ function perfRows(run) {
 function renderSummary(run) {
   if (run) perfRun = run;
   run = perfRun;
-  if (!run) { $("#summary").innerHTML = '<div class="muted small">No performance run yet. Run one of the elbencho presets or Perf Test.</div>'; $("#perfCsv").disabled = true; return; }
+  if (!run) { $("#summary").innerHTML = '<div class="muted small">No performance run yet. Run one of the elbencho presets.</div>'; $("#perfCsv").disabled = true; return; }
   const { agg } = perfRows(run), u = perfUnit();
   $("#perfCsv").disabled = !agg.length;
   if (!agg.length) { $("#summary").innerHTML = `<div class="muted small">${esc(run.label || run.run_id)}: no elbencho result table found in the output${run.status === "failed" ? " (the run failed - see 🗒 Logs)" : ""}.</div>`; return; }

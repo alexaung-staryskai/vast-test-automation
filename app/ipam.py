@@ -146,6 +146,11 @@ async def check(client, vip_cfg: dict, choice_start: str | None = None, auto: bo
     proposal = None
     if choice_start:
         s = ip2int(choice_start)
+        # a click inside a free run that is big enough picks the block containing it (e.g. near the end of
+        # the run the block starts earlier), instead of requiring the exact first IP of the block
+        run = next(((a, b) for a, b in blocks if a <= s <= b), None)
+        if run:
+            s = min(s, run[1] - count + 1)
         e = s + count - 1
         if all(n in candidates and n not in used for n in range(s, e + 1)):
             proposal = (s, e)

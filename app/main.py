@@ -508,12 +508,24 @@ class VipSelectIn(BaseModel):
 
 @app.post("/api/vip/select")
 async def vip_select(body: VipSelectIn) -> dict:
-    state.provisioner.vip_choice = body.start or None
-    state.provisioner._save_state()
+    p = state.provisioner
+    previous = p.vip_choice
+    p.vip_choice = body.start or None
     if body.start:  # picking a range on the map means manual selection for this session
         state.vip_overrides["auto_select"] = False
         state.cfg["vip_pool"]["auto_select"] = False
-    return await vip_check()
+    res = await vip_check()
+    if body.start:
+        if res.get("proposal"):
+            p.vip_choice = res["proposal"]["start"]   # the block actually chosen (a click may have been snapped)
+        elif previous and previous != body.start:
+            # the clicked IP can't start a block: keep the earlier choice instead of ending up with none
+            p.vip_choice = previous
+            res = {**await vip_check(), "rejected": body.start}
+            res["warnings"] = [f"{body.start} is not inside a run of {res['ip_count']} free IPs - kept "
+                               f"{previous}"] + [w for w in res.get("warnings", []) if body.start not in w]
+    p._save_state()
+    return res
 
 
 @app.get("/api/provision/state")

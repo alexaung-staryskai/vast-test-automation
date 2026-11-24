@@ -25,6 +25,7 @@
       <button class="tab active" data-tab="t1" role="tab">① Onboarding &amp; API tests</button>
       <button class="tab" data-tab="t4" role="tab">🏢 Tenants <span id="tenantCount" class="count"></span></button>
       <button class="tab" data-tab="t2" role="tab">② Clients · Mount · Performance</button>
+      <button class="tab" data-tab="t6" role="tab">📈 Chart</button>
       <button class="tab" data-tab="t5" role="tab">🗒 Logs <span id="logCount" class="count"></span></button>
       <button class="tab" data-tab="t3" role="tab">⚙ Configuration</button>
     </nav>
@@ -111,7 +112,7 @@
         </div>
       </div>
       <div id="varsMsg" class="small"></div>
-      <div class="vargroups" id="vars"></div>
+      <div class="onboarding" id="vars"></div>
       <div id="vipHolder" hidden></div>
     </section>
 
@@ -121,9 +122,8 @@
         <label class="f-field" title="vip_pool.ip_count (minimum 5)">Number of IPs<input name="ip_count" type="text" inputmode="numeric" value="5"></label>
         <label class="f-field">Subnet CIDR (IPv4)<span class="prefix"><b>/</b><input name="subnet_cidr" type="text" inputmode="numeric" value="16"></span></label>
         <label class="f-field" title="vip_pool.vlan (0 = none)">VLAN<input name="vlan" type="text" inputmode="numeric" value="0" title="0 = no VLAN"></label>
-        <label class="f-field check vip-auto" title="vip_pool.auto_select">
-          <input name="auto_select" type="checkbox" checked> Auto VIP pool selection
-          <span class="hint">On: step 1 picks the first free block. Off: use the range you choose on the IP map.</span></label>
+        <label class="f-field check vip-auto" title="On: step 1 picks the first free block. Off: step 1 uses the range you choose on the IP map. (vip_pool.auto_select)">
+          <input name="auto_select" type="checkbox" checked> Pick the VIP range automatically</label>
       </form>
       <div id="vipPick" class="vip-pick">
         <button type="button" class="btn" id="vipOpen">🗺 Choose VIP range…</button>
@@ -152,7 +152,7 @@
       <div class="card-head">
         <h2>Tenant onboarding steps</h2>
         <div class="btn-row">
-          <button class="btn primary" id="runAll">▶ Run all</button>
+          <button class="btn primary" id="runAll" title="Run all onboarding steps in order: VIP check, tenant, admin, VIP pool, quota, QoS, S3 user, view policy, view">▶ Create Tenant</button>
           <button class="btn" id="showSecrets">🔑 Credentials</button>
           <button class="btn" id="exportProv">⤓ Export report</button>
           <button class="btn danger" id="cleanup" title="Delete created objects in reverse order">🧹 Cleanup</button>
@@ -209,7 +209,7 @@
       <div id="clientList" class="clientlist"></div>
     </section>
 
-    <div id="presetsHint" class="card muted small presets-hint">Required packages and presets (mount, elbencho, perf test…) appear here once a console is connected.</div>
+    <div id="presetsHint" class="card muted small presets-hint">Required packages and presets (mount, elbencho…) appear here once a console is connected.</div>
     <section class="card collapsible" id="pkgCard" hidden>
       <div class="card-head">
         <h2><button type="button" class="collapse-toggle" aria-expanded="true" aria-controls="pkgCard" title="Hide / show this section"><span class="chev" aria-hidden="true">▾</span> Required packages</button></h2>
@@ -255,6 +255,42 @@
       <h3>Performance result files</h3>
       <ul id="files" class="files"></ul>
       <div class="muted small">Logs of all other runs (package checks, installs, mounts, console exports…) are in the <a href="#" data-goto="t5">🗒 Logs</a> tab.</div>
+    </section>
+  </main>
+
+  <!-- ================= CHART ================= -->
+  <main id="t6" class="tabpanel">
+    <section class="card chart-card viz-root">
+      <div class="card-head">
+        <div><h2>Performance chart</h2><div class="muted small" id="chartInfo"></div></div>
+      </div>
+      <!-- filters: one row above the chart -->
+      <div class="chart-filters" role="toolbar" aria-label="Chart options">
+        <span class="seg" role="radiogroup" aria-label="View">
+          <button class="btn sm" data-view="timeline" role="radio">Timeline</button>
+          <button class="btn sm" data-view="compare" role="radio">Compare sessions</button>
+        </span>
+        <label class="small">Metric <select id="chartMetric"><option value="tp">Throughput</option><option value="iops">IOPS</option></select></label>
+        <label class="small" id="chartUnitWrap">Unit <select id="chartUnit"><option value="MB">MB/s</option><option value="GB">GB/s</option><option value="TB">TB/s</option></select></label>
+        <label class="small check"><input type="checkbox" id="chartTableToggle"> Table view</label>
+        <button class="btn sm ghost" id="chartRefresh">↻ Refresh</button>
+      </div>
+      <div class="chart-layout">
+        <div class="chart-main">
+          <div class="chart-legend" id="chartLegend" aria-label="Series"></div>
+          <div class="chart-wrap" id="chartWrap">
+            <svg id="perfChart" role="img" aria-labelledby="chartInfo"></svg>
+            <div class="chart-tip" id="chartTip" role="status" hidden></div>
+          </div>
+          <div class="chart-empty muted" id="chartEmpty" hidden></div>
+          <div class="table-wrap" id="chartTable" hidden></div>
+        </div>
+        <aside class="chart-sessions" aria-label="Test sessions">
+          <div class="cs-head"><b>Test sessions</b>
+            <span><button class="btn sm ghost" id="csAll">Show all</button><button class="btn sm ghost" id="csNone">Hide all</button></span></div>
+          <div class="cs-list" id="csList"></div>
+        </aside>
+      </div>
     </section>
   </main>
 
@@ -322,5 +358,6 @@
   <script src="/static/vendor/addon-fit.min.js"></script>
   <script src="/static/vendor/addon-webgl.min.js"></script>
   <script src="/static/app.js"></script>
+  <script src="/static/chart.js"></script>
 </body>
 </html>
