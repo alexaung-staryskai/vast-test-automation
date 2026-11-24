@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VAST Test Bench</title>
+  <script>
+    // apply the saved theme before first paint
+    try { const t = localStorage.getItem("theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch {}
+  </script>
+  <link rel="stylesheet" href="/static/vendor/xterm.min.css">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">▲</span>
+      <div>
+        <div class="title">VAST Test Bench</div>
+        <div class="sub" id="cfgPath">choose a test site</div>
+      </div>
+    </div>
+    <nav class="tabs" role="tablist">
+      <button class="tab" data-tab="t0" role="tab">📁 Test site</button>
+      <button class="tab active" data-tab="t1" role="tab">① Onboarding &amp; API tests</button>
+      <button class="tab" data-tab="t4" role="tab">🏢 Tenants <span id="tenantCount" class="count"></span></button>
+      <button class="tab" data-tab="t2" role="tab">② Clients · Mount · Performance</button>
+      <button class="tab" data-tab="t5" role="tab">🗒 Logs <span id="logCount" class="count"></span></button>
+      <button class="tab" data-tab="t3" role="tab">⚙ Configuration</button>
+    </nav>
+    <div class="btn-row">
+      <button class="btn ghost" id="siteBack" title="Close this test site and go back to the list of test sites">⇠ All sites</button>
+      <button class="btn site-btn" id="siteBtn" title="Switch or create a test site">📁 <span id="siteName">no site</span></button>
+      <button class="btn ghost" id="themeBtn" title="Switch theme">◐ Auto</button>
+      <button class="btn ghost" id="reloadCfg" title="Re-read the config file">↻ Reload</button>
+    </div>
+  </header>
+
+  <div id="warnings" class="warnings" hidden></div>
+
+  <!-- ================= TEST SITES ================= -->
+  <main id="t0" class="tabpanel sitescreen">
+    <div id="siteCurrent" hidden></div>
+    <section class="card">
+      <div class="card-head">
+        <div><h2>Test sites</h2><span class="muted small" id="sitesDir"></span></div>
+        <button class="btn primary" id="siteNewBtn">＋ New Test Site</button>
+      </div>
+      <p class="muted small">A test site is a folder that holds everything for one test: configuration, onboarded tenants and results.
+        Copy or zip the folder to let someone else open it and replicate the steps.</p>
+      <div id="siteCreatePanel" class="createpanel" hidden>
+        <h3>New test site</h3>
+        <form id="siteCreate" class="f-grid" autocomplete="off">
+          <label class="f-field">Test site name<input name="name" required placeholder="e.g. ACME POC Nov 2026" maxlength="64"></label>
+          <label class="f-field">Description (optional)<input name="description" placeholder="customer, cluster, goal…"></label>
+          <label class="f-field">Start from<select name="template" id="siteTemplate"></select><span class="hint small muted" id="siteTemplateDesc"></span></label>
+          <div class="f-field"><span>&nbsp;</span><span class="btn-row">
+            <button class="btn primary" type="submit">Create and open</button>
+            <button class="btn ghost" type="button" id="siteCreateCancel">Cancel</button></span></div>
+        </form>
+        <div id="siteCreateMsg" class="small"></div>
+      </div>
+      <div id="siteList" class="sitetable-wrap"></div>
+      <div id="siteListMsg" class="small"></div>
+      <h3>Open from a folder</h3>
+      <form id="siteOpenPath" class="custom">
+        <input name="path" placeholder="/path/to/test-site (a folder with config.yaml, e.g. one you received or unzipped)" style="flex:1; min-width:280px">
+        <button class="btn" type="submit">Open folder</button>
+      </form>
+      <div id="siteOpenMsg" class="small"></div>
+    </section>
+  </main>
+
+  <!-- ================= TAB 1 ================= -->
+  <main id="t1" class="tabpanel active">
+    <section class="card">
+      <div class="card-head">
+        <h2>VMS connection</h2>
+        <div class="btn-row">
+          <span id="vmsDirty" class="dirty" hidden>● unsaved</span>
+          <button class="btn" id="vmsTest" title="Test with the values in this form">Test connection</button>
+          <button class="btn primary" id="vmsSave">💾 Save</button>
+        </div>
+      </div>
+      <form id="vmsForm" class="f-grid vmsform" autocomplete="off" onsubmit="return false">
+        <label class="f-field">VMS URL<input name="url" type="text" placeholder="https://10.0.0.10"></label>
+        <label class="f-field">API base path<input name="api_base" type="text" placeholder="/api/v8"></label>
+        <label class="f-field">Authentication
+          <select name="auth_type">
+            <option value="api_token">API token</option>
+            <option value="bearer">Username / password (JWT)</option>
+            <option value="basic">Username / password (basic)</option>
+          </select></label>
+        <label class="f-field auth-token">Auth token
+          <span class="pw"><input name="api_token" type="password" placeholder="token or ${env:VMS_API_TOKEN}" autocomplete="new-password"><button type="button" class="btn sm ghost eye" title="Show / hide">👁</button></span></label>
+        <label class="f-field auth-user">Username<input name="username" type="text" autocomplete="off"></label>
+        <label class="f-field auth-user">Password
+          <span class="pw"><input name="password" type="password" autocomplete="new-password"><button type="button" class="btn sm ghost eye" title="Show / hide">👁</button></span></label>
+        <label class="f-field">Timeout (s)<input name="timeout_seconds" type="number" min="1"></label>
+        <label class="f-field check"><input name="verify_ssl" type="checkbox"> Verify SSL certificate</label>
+      </form>
+      <div id="vmsResult" class="muted small"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Onboarding settings</h2>
+        <div class="btn-row">
+          <span class="muted small">Grouped in onboarding order. Edits apply to this session.</span>
+          <button class="btn" id="varsSave" title="Write these values to this test site's config.yaml">💾 Save as site defaults</button>
+        </div>
+      </div>
+      <div id="varsMsg" class="small"></div>
+      <div class="vargroups" id="vars"></div>
+      <div id="vipHolder" hidden></div>
+    </section>
+
+    <!-- VIP pool settings: moved into the "VIP Pool" box by renderVars() -->
+    <div hidden>
+      <form id="vipSettings" class="vipsettings" autocomplete="off" onsubmit="return false">
+        <label class="f-field" title="vip_pool.ip_count (minimum 5)">Number of IPs<input name="ip_count" type="text" inputmode="numeric" value="5"></label>
+        <label class="f-field">Subnet CIDR (IPv4)<span class="prefix"><b>/</b><input name="subnet_cidr" type="text" inputmode="numeric" value="16"></span></label>
+        <label class="f-field" title="vip_pool.vlan (0 = none)">VLAN<input name="vlan" type="text" inputmode="numeric" value="0" title="0 = no VLAN"></label>
+        <label class="f-field check vip-auto" title="vip_pool.auto_select">
+          <input name="auto_select" type="checkbox" checked> Auto VIP pool selection
+          <span class="hint">On: step 1 picks the first free block. Off: use the range you choose on the IP map.</span></label>
+      </form>
+      <div id="vipPick" class="vip-pick">
+        <button type="button" class="btn" id="vipOpen">🗺 Choose VIP range…</button>
+        <span id="vipChoiceLine" class="small muted"></span>
+      </div>
+      <div id="vipSettingsMsg" class="small"></div>
+    </div>
+
+    <!-- VIP pool IP plan (modal) -->
+    <div id="vipModal" class="modal-backdrop" hidden>
+      <div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="vipModalTitle">
+        <div class="card-head">
+          <h3 id="vipModalTitle">VIP pool IP plan</h3>
+          <div class="btn-row">
+            <button class="btn" id="vipCheck">↻ Check VIP ranges</button>
+            <button class="btn ghost" id="vipClear" title="Clear the chosen range and let the app pick the first free block">Use automatic selection</button>
+            <button class="btn primary" id="vipClose">Done</button>
+          </div>
+        </div>
+        <div id="vipSummary" class="muted small">Reads every VIP pool and compute-cluster IP on the cluster and proposes a free block inside the configured candidate ranges. Click a free IP to start the block there.</div>
+        <div id="vipMap"></div>
+      </div>
+    </div>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Tenant onboarding steps</h2>
+        <div class="btn-row">
+          <button class="btn primary" id="runAll">▶ Run all</button>
+          <button class="btn" id="showSecrets">🔑 Credentials</button>
+          <button class="btn" id="exportProv">⤓ Export report</button>
+          <button class="btn danger" id="cleanup" title="Delete created objects in reverse order">🧹 Cleanup</button>
+          <button class="btn ghost" id="resetProv" title="Forget created objects without deleting them">Reset state</button>
+        </div>
+      </div>
+      <div id="provSummary" class="muted small"></div>
+      <div id="provProgress" class="run-progress" hidden aria-live="polite"></div>
+      <div id="secrets"></div>
+      <table class="steps">
+        <thead><tr><th>#</th><th>Status</th><th>Step</th><th>Request</th><th>Time</th><th></th></tr></thead>
+        <tbody id="steps"></tbody>
+      </table>
+      <div id="cleanupOut"></div>
+    </section>
+  </main>
+
+  <!-- ================= TENANTS ================= -->
+  <main id="t4" class="tabpanel">
+    <section class="card">
+      <div class="card-head">
+        <h2>Onboarded tenants</h2>
+        <div class="btn-row">
+          <label class="small muted"><input type="checkbox" id="showDeleted"> show deleted</label>
+          <button class="btn ghost" id="refreshTenants">↻ Refresh</button>
+        </div>
+      </div>
+      <div id="tenantsInfo" class="muted small"></div>
+    </section>
+    <div id="tenantList" class="tenants"></div>
+  </main>
+
+  <!-- ================= TAB 2 ================= -->
+  <main id="t2" class="tabpanel">
+    <section class="card">
+      <div class="card-head">
+        <h2>Consoles</h2>
+        <div class="btn-row">
+          <select id="clientSelect"></select>
+          <button class="btn primary" id="addConsole">+ Add console</button>
+          <button class="btn" id="openAll">Open all configured</button>
+        </div>
+      </div>
+      <form id="customForm" class="custom" hidden>
+        <input name="name" placeholder="name (optional)">
+        <input name="host" placeholder="host / IP" required>
+        <input name="port" placeholder="22" size="5">
+        <input name="username" placeholder="user (default from config)">
+        <input name="password" type="password" placeholder="password (default from config)" autocomplete="new-password">
+        <label class="save-client" title="Adds it to clients: in this site's config.yaml. A password goes to a hidden file (.client-secrets.json, mode 600), never into config.yaml or the site zip.">
+          <input name="save" type="checkbox" checked> 💾 Save to client list</label>
+        <button class="btn primary" type="submit">Connect</button>
+      </form>
+      <div id="clientList" class="clientlist"></div>
+    </section>
+
+    <div id="presetsHint" class="card muted small presets-hint">Required packages and presets (mount, elbencho, perf test…) appear here once a console is connected.</div>
+    <section class="card collapsible" id="pkgCard" hidden>
+      <div class="card-head">
+        <h2><button type="button" class="collapse-toggle" aria-expanded="true" aria-controls="pkgCard" title="Hide / show this section"><span class="chev" aria-hidden="true">▾</span> Required packages</button></h2>
+        <div class="btn-row">
+          <button class="btn" id="pkgCheck">Check packages</button>
+          <button class="btn primary" id="pkgInstall">Install missing</button>
+          <button class="btn" id="pkgUpdate">Update</button>
+          <span id="pkgGroups" class="btn-row"></span>
+        </div>
+      </div>
+      <div id="pkgTable" class="muted small">Runs on the consoles that are ticked ✓. Install/update commands come from the <code>packages</code> section of the config.</div>
+    </section>
+
+    <section class="card collapsible" id="presetsCard" hidden>
+      <div class="card-head">
+        <h2><button type="button" class="collapse-toggle" aria-expanded="true" aria-controls="presetsCard" title="Hide / show this section"><span class="chev" aria-hidden="true">▾</span> Presets</button></h2>
+        <span class="muted small">Runs on the consoles that are ticked ✓ · <a href="#" id="toggleCmds">show commands</a></span>
+      </div>
+      <div class="kv small" id="mountInfo"></div>
+      <div class="btn-row" id="presets"></div>
+      <div id="cmdList" class="cmdlist" hidden></div>
+      <div id="runStatus" class="runstatus"></div>
+    </section>
+
+    <div id="consoles" class="consoles"></div>
+    <div id="noConsoles" class="empty">No consoles yet. Pick a client and click <b>+ Add console</b>.</div>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Performance results</h2>
+        <div class="btn-row perf-controls">
+          <label class="small muted" for="perfRun">Run</label>
+          <select id="perfRun" title="Performance run to show"></select>
+          <label class="small muted" for="perfUnit">Unit</label>
+          <select id="perfUnit" title="Throughput unit (decimal: 1 GB/s = 1000 MB/s; elbencho reports MiB/s)">
+            <option value="MB">MB/s</option><option value="GB">GB/s</option><option value="TB">TB/s</option>
+          </select>
+          <button class="btn" id="perfCsv" title="Download this run's results as CSV, in the chosen unit">⤓ CSV</button>
+          <button class="btn ghost" id="refreshResults">↻ Refresh</button>
+        </div>
+      </div>
+      <div id="summary"></div>
+      <h3>Performance result files</h3>
+      <ul id="files" class="files"></ul>
+      <div class="muted small">Logs of all other runs (package checks, installs, mounts, console exports…) are in the <a href="#" data-goto="t5">🗒 Logs</a> tab.</div>
+    </section>
+  </main>
+
+  <!-- ================= LOGS ================= -->
+  <main id="t5" class="tabpanel">
+    <section class="card logs-card">
+      <div class="card-head">
+        <div><h2>Logs</h2><div class="muted small" id="logsInfo"></div></div>
+        <div class="btn-row">
+          <button class="btn ghost" id="logsRefresh">↻ Refresh</button>
+          <button class="btn" id="logsArchive" title="Zip the logs into results/archive/ and remove them from this list">🗄 Archive logs</button>
+          <button class="btn danger" id="logsPurge" title="Delete the logs permanently">🗑 Purge logs</button>
+        </div>
+      </div>
+      <div id="logsMsg" class="small"></div>
+      <!-- reading pane layout: list (1/3) | selected file (2/3) -->
+      <div class="logs-split">
+        <div class="logs-listpane">
+          <div class="logs-filters">
+            <select id="logsType" title="Type"><option value="">All types</option></select>
+            <select id="logsStatus" title="Status"><option value="">Any status</option><option value="done">done</option><option value="failed">failed</option></select>
+            <input id="logsSearch" type="search" placeholder="Search name, client…">
+          </div>
+          <div id="logsList" class="logs-list" tabindex="0" role="listbox" aria-label="Log files"></div>
+          <label class="logs-perf small" title="Archive and Purge leave elbencho (performance) results alone unless this is ticked">
+            <input type="checkbox" id="logsInclPerf"> Archive / purge performance results too</label>
+        </div>
+        <div class="logs-viewpane">
+          <div id="logView" class="logview-empty muted">Select a log on the left to read it here.</div>
+        </div>
+      </div>
+    </section>
+    <section class="card" id="archivesCard" hidden>
+      <div class="card-head"><h2>Archives</h2><span class="muted small">results/archive/ · kept by Purge</span></div>
+      <table class="logtable"><thead><tr><th>Archive</th><th>Created</th><th class="num">Size</th></tr></thead><tbody id="archivesBody"></tbody></table>
+    </section>
+  </main>
+
+  <!-- ================= TAB 3 ================= -->
+  <main id="t3" class="tabpanel">
+    <section class="card">
+      <div class="card-head">
+        <h2>Configuration</h2>
+        <div class="btn-row">
+          <div class="seg" role="group">
+            <button class="seg-btn active" data-mode="form">Form</button>
+            <button class="seg-btn" data-mode="yaml">YAML</button>
+          </div>
+          <span id="cfgDirty" class="dirty" hidden>● unsaved changes</span>
+          <button class="btn" id="cfgValidate">Validate</button>
+          <button class="btn ghost" id="cfgRevert">Revert</button>
+          <button class="btn primary" id="cfgSave">💾 Save</button>
+        </div>
+      </div>
+      <div id="cfgMsg" class="small"></div>
+      <div id="cfgOverview" class="overview"></div>
+    </section>
+    <div id="cfgForm"></div>
+    <section class="card" id="cfgYamlCard" hidden>
+      <textarea id="cfgYaml" class="yaml" spellcheck="false"></textarea>
+    </section>
+  </main>
+
+  <script src="/static/vendor/xterm.min.js"></script>
+  <script src="/static/vendor/addon-fit.min.js"></script>
+  <script src="/static/vendor/addon-webgl.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

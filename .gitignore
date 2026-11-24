@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+config.yaml
+results/
+*.pyc
+results-mock/
+dev/.mock_host_key
+config-backups/
+tenants.yaml
+tenants-*.yaml
+sites/
+dev/mock-site/results/
+dev/mock-site/tenants.yaml
+dev/mock-site/config-backups/
+.run/
+# never commit credentials (also inside sites/, which is ignored anyway)
+.client-secrets.json
+.tenant-secrets.json
+*.secrets.json
+.env
+# the mock site's config only has mock values - needed for "Trying it without the VPN"
+!dev/mock-site/config.yaml
+.DS_Store
+# your own site templates (e.g. internal lab hosts): templates/local-*.yaml stay on this machine
+templates/local-*.yaml

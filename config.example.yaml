@@ -1,0 +1,553 @@
+# =====================================================================
+#  VAST testing automation - configuration
+#  Copy to config.yaml (./run.sh does this on first start) and edit it,
+#  either here or in the app's "Configuration" tab.
+#
+#  Any value can read an environment variable with  ${env:NAME}
+#  (keeps the API token / passwords out of the file).
+#
+#  References available in steps and commands:
+#    ${vars.<name>}          a variable from "vars" (editable in Tab 1; vars may reference other vars)
+#    ${cfg.<section>.<key>}  any value from this file, e.g. ${cfg.vip_pool.subnet_cidr}
+#    ${<step_id>.<field>}    a field from an earlier provisioning step's response, e.g. ${tenant.id}
+#    ${vip.start} / ${vip.end} / ${vip.ips}   the VIP range chosen by the VIP check
+#    ${mount.<key>}          the "mount" section below (client commands)
+#    ${client.name} / ${client.host} / ${client.vip}   (client commands)
+#  Plain shell variables such as $DEV or ${HOME} are left untouched.
+# =====================================================================
+
+app:
+  host: 127.0.0.1          # keep on localhost - the app holds credentials and shell access
+  port: 8080
+  results_dir: results     # exported JSON / TXT results go here
+  tenants_file: tenants.yaml   # onboarded tenants (shown in the Tenants tab)
+  store_secrets: false     # true = also keep the admin password and S3 secret key in tenants.yaml
+
+# ---------------------------------------------------------------------
+# VMS REST API
+# ---------------------------------------------------------------------
+vms:
+  url: https://10.0.0.10           # VMS address (reachable over the VPN)
+  api_base: /api/v8                # VMS 5.5 = /api/v8 (or /api/latest)
+  auth_type: api_token             # api_token | bearer (username/password -> JWT) | basic
+  api_token: "${env:VMS_API_TOKEN}"
+  username: ""
+  password: ""
+  token_endpoint: /token/          # bearer only, relative to api_base
+  verify_ssl: false                # VMS usually has a self-signed certificate
+  timeout_seconds: 30
+  health_endpoint: /clusters/      # used by "Test connection"
+
+# ---------------------------------------------------------------------
+# Variables (Tab 1). Change tenant_name and every derived name follows.
+# ---------------------------------------------------------------------
+vars:
+  tenant_name: perf-tenant-01
+  tenant_admin_username: "${vars.tenant_name}-admin"
+  tenant_admin_password: "${env:TENANT_ADMIN_PASSWORD}"   # empty = a random password is generated at run time
+  tenant_admin_role: "${vars.tenant_name}-admin-role"
+  vip_pool_name: "vip-${vars.tenant_name}"
+  quota_name: "quota-${vars.tenant_name}"
+  quota_hard_limit: 10 TB                    # MB | GB | TB  (decimal: 1 TB = 10^12 bytes)
+  quota_soft_limit: 0 TB                     # 0 = no soft limit
+  qos_name: "qos-${vars.tenant_name}"
+  qos_read_limit: 500 MB/s                   # MB/s | GB/s - VMS minimum is 100 MB/s (0 = unlimited)
+  qos_write_limit: 1 GB/s
+  s3_user_name: "${vars.tenant_name}-s3"
+  view_policy_name: "vp-${vars.tenant_name}"
+  view_policy_flavor: MIXED_LAST_WINS        # NFS | SMB | S3_NATIVE | BLOCK | MIXED_LAST_WINS
+  view_name: "${vars.tenant_name}-default-view"
+  view_path: "/${vars.tenant_name}-default-view"
+  view_protocols: [NFS, S3]
+  bucket_name: "${vars.tenant_name}-default-view"
+
+# ---------------------------------------------------------------------
+# VIP pool IP planning. The VIP check reads every VIP pool and compute-cluster
+# IP on the cluster, marks those as used, and proposes the first free block of
+# ip_count consecutive IPs inside the candidate ranges below.
+# ---------------------------------------------------------------------
+vip_pool:
+  ranges:                      # candidate ranges the tenant's VIP pool may use
+    - start: 10.20.0.10
+      end: 10.20.0.250
+  ip_count: 5                  # IPs per VIP pool (minimum 5)
+  subnet_cidr: 16
+  gateway: ""                  # optional
+  vlan: 0                      # optional, 0 = none
+  role: PROTOCOLS
+  ping_check: false            # also ping free candidates from this laptop; replies count as used
+
+tenant_admin:
+  user_type: TENANT_ADMIN
+  password_length: 16
+  role_permissions: [create_applications, create_database, create_events, create_hardware, create_logical,
+    create_monitoring, create_security, create_settings, create_support, delete_applications, delete_database,
+    delete_events, delete_hardware, delete_logical, delete_monitoring, delete_security, delete_settings,
+    delete_support, edit_applications, edit_database, edit_events, edit_hardware, edit_logical, edit_monitoring,
+    edit_security, edit_settings, edit_support, view_applications, view_database, view_events, view_hardware,
+    view_logical, view_monitoring, view_security, view_settings, view_support]
+
+# ---------------------------------------------------------------------
+# Step 1 - tenant onboarding + API tests. Same order and payloads as the
+# Tenant onboarding web application (validated on VMS 5.5).
+#   exists_by      check the collection for an object with the same value first
+#   verify         GET + expected fields after creation (the test); the GET
+#                  response is also saved, e.g. for ${tenant.local_provider_id}
+#   omit_if_empty  body keys dropped when empty / 0
+#   cleanup        call used by the Cleanup button (runs in reverse order)
+# ---------------------------------------------------------------------
+provisioning:
+  on_existing: fail            # fail | reuse - when an object with the same name already exists
+  continue_on_error: false
+  steps:
+    - id: vip
+      name: Check VIP pool range & pick free IPs
+      type: vip_check
+
+    - id: tenant
+      name: Create tenant
+      method: POST
+      endpoint: /tenants/
+      exists_by: name
+      body:
+        name: "${vars.tenant_name}"
+      verify:
+        endpoint: /tenants/${tenant.id}/
+        expect: { name: "${vars.tenant_name}" }
+      cleanup: { method: DELETE, endpoint: "/tenants/${tenant.id}/" }
+
+    - id: admin_role
+      name: Create tenant admin role
+      method: POST
+      endpoint: /roles/
+      exists_by: name
+      body:
+        name: "${vars.tenant_admin_role}"
+        tenant_id: "${tenant.id}"
+        permissions_list: "${cfg.tenant_admin.role_permissions}"
+      verify:
+        endpoint: /roles/${admin_role.id}/
+        expect: { name: "${vars.tenant_admin_role}" }
+      cleanup: { method: DELETE, endpoint: "/roles/${admin_role.id}/" }
+
+    - id: tenant_admin
+      name: Create tenant admin
+      method: POST
+      endpoint: /managers/
+      exists_by: username
+      body:
+        username: "${vars.tenant_admin_username}"
+        password: "${vars.tenant_admin_password}"
+        first_name: "${vars.tenant_name}"
+        last_name: admin
+        user_type: "${cfg.tenant_admin.user_type}"
+        tenant_id: "${tenant.id}"
+        roles: ["${admin_role.id}"]
+      verify:
+        endpoint: /managers/${tenant_admin.id}/
+        expect: { username: "${vars.tenant_admin_username}" }
+      cleanup: { method: DELETE, endpoint: "/managers/${tenant_admin.id}/" }
+
+    - id: vippool
+      name: Create VIP pool
+      method: POST
+      endpoint: /vippools/
+      exists_by: name
+      body:
+        name: "${vars.vip_pool_name}"
+        ip_ranges: [["${vip.start}", "${vip.end}"]]
+        subnet_cidr: "${cfg.vip_pool.subnet_cidr}"
+        role: "${cfg.vip_pool.role}"
+        tenant_id: "${tenant.id}"
+        gw_ip: "${cfg.vip_pool.gateway}"
+        vlan: "${cfg.vip_pool.vlan}"
+      omit_if_empty: [gw_ip, vlan]
+      verify:
+        endpoint: /vippools/${vippool.id}/
+        expect: { name: "${vars.vip_pool_name}" }
+      cleanup: { method: DELETE, endpoint: "/vippools/${vippool.id}/" }
+
+    - id: quota
+      name: Create quota (creates the view directory)
+      method: POST
+      endpoint: /quotas/
+      exists_by: name
+      body:
+        name: "${vars.quota_name}"
+        path: "${vars.view_path}"
+        hard_limit: "${vars.quota_hard_limit_bytes}"   # derived from quota_hard_limit
+        soft_limit: "${vars.quota_soft_limit_bytes}"
+        tenant_id: "${tenant.id}"
+        create_dir: true
+      omit_if_empty: [soft_limit]
+      verify:
+        endpoint: /quotas/${quota.id}/
+        expect: { hard_limit: "${vars.quota_hard_limit_bytes}" }
+      cleanup: { method: DELETE, endpoint: "/quotas/${quota.id}/" }
+
+    - id: qos
+      name: Create QoS policy
+      method: POST
+      endpoint: /qospolicies/
+      exists_by: name
+      body:
+        name: "${vars.qos_name}"
+        mode: STATIC
+        policy_type: VIEW
+        tenant_id: "${tenant.id}"
+        static_limits:
+          max_reads_bw_mbps: "${vars.qos_read_limit_mbps}"    # derived from qos_read_limit
+          max_writes_bw_mbps: "${vars.qos_write_limit_mbps}"
+      verify:
+        endpoint: /qospolicies/${qos.id}/
+        expect: { name: "${vars.qos_name}" }
+      cleanup: { method: DELETE, endpoint: "/qospolicies/${qos.id}/" }
+
+    - id: s3_user
+      name: Create S3 user (tenant local provider)
+      method: POST
+      endpoint: /users/
+      exists_by: name
+      body:
+        name: "${vars.s3_user_name}"
+        local_provider_id: "${tenant.local_provider_id}"
+        allow_create_bucket: true
+      verify:
+        endpoint: /users/${s3_user.id}/
+        expect: { name: "${vars.s3_user_name}" }
+      cleanup: { method: DELETE, endpoint: "/users/${s3_user.id}/" }
+
+    - id: s3_keys
+      name: Generate S3 access key
+      method: POST
+      endpoint: /users/${s3_user.id}/access_keys/
+      body:
+        tenant_id: "${tenant.id}"
+
+    - id: view_policy
+      name: Create view policy (bound to VIP pool)
+      method: POST
+      endpoint: /viewpolicies/
+      exists_by: name
+      body:
+        name: "${vars.view_policy_name}"
+        tenant_id: "${tenant.id}"
+        flavor: "${vars.view_policy_flavor}"
+        permission_per_vip_pool: { "${vippool.id}": RW }   # VMS 5.5 binds VIP pools this way
+        nfs_read_write: ["*"]
+        nfs_root_squash: ["*"]       # VMS needs at least one squash entry
+        nfs_no_squash: []
+        s3_read_write: ["*"]
+      verify:
+        endpoint: /viewpolicies/${view_policy.id}/
+        expect: { name: "${vars.view_policy_name}" }
+      cleanup: { method: DELETE, endpoint: "/viewpolicies/${view_policy.id}/" }
+
+    - id: view
+      name: Create view (NFS + S3 bucket, QoS)
+      method: POST
+      endpoint: /views/
+      exists_by: name
+      body:
+        name: "${vars.view_name}"
+        path: "${vars.view_path}"
+        protocols: "${vars.view_protocols}"
+        policy_id: "${view_policy.id}"
+        tenant_id: "${tenant.id}"
+        qos_policy_id: "${qos.id}"
+        create_dir: false            # the quota already created the directory
+        bucket: "${vars.bucket_name}"
+        bucket_owner: "${vars.s3_user_name}"
+      verify:
+        endpoint: /views/${view.id}/
+        expect: { path: "${vars.view_path}", policy_id: "${view_policy.id}" }
+      cleanup: { method: DELETE, endpoint: "/views/${view.id}/" }
+
+# ---------------------------------------------------------------------
+# SSH clients (Step 2 / Step 3)
+# ---------------------------------------------------------------------
+ssh:
+  username: root
+  password: "${env:SSH_PASSWORD}"
+  port: 22
+  use_sudo: auto          # auto = wrap preset commands in sudo when username is not root; true / false
+  connect_timeout_seconds: 15
+  connect_retries: 2      # extra attempts when an SSH handshake times out (VPN hiccups)
+  idle_close_minutes: 60  # consoles stay open when the page is reloaded/closed; close them after this many minutes with no page showing them (0 = never)
+
+clients:
+  - name: client-01
+    host: 10.0.0.101
+  - name: client-02
+    host: 10.0.0.102
+  # per-client overrides are allowed:
+  # - name: client-03
+  #   host: 10.0.0.103
+  #   username: ubuntu
+  #   password: "${env:CLIENT03_PASSWORD}"
+
+# ---------------------------------------------------------------------
+# Standard NFSv3 mount + read-ahead
+# ---------------------------------------------------------------------
+mount:
+  mount_point: /mnt/vast
+  export_path: "${vars.view_path}"
+  vip: auto                 # auto = spread clients round-robin over the tenant's VIP pool IPs; or a fixed IP
+  # nconnect needs Linux kernel >= 5.3. With the VAST NFS driver (vastnfs) you can add multipath:
+  #   remoteports=<first VIP>-<last VIP>,spread_reads,spread_writes
+  options: vers=3,proto=tcp,nconnect=16,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noatime,nodiratime,lookupcache=positive
+  command: mount -t nfs -o ${mount.options} ${client.vip}:${mount.export_path} ${mount.mount_point}
+  read_ahead_kb: 16384
+  read_ahead_command: 'DEV=$(mountpoint -d ${mount.mount_point}) && echo ${mount.read_ahead_kb} > /sys/class/bdi/$DEV/read_ahead_kb && echo "read_ahead_kb for $DEV = $(cat /sys/class/bdi/$DEV/read_ahead_kb)"'
+
+# ---------------------------------------------------------------------
+# elbencho benchmark (Tab 2 -> Elbencho Write / Elbencho Read / Elbencho Auto Read/Write / Perf Test)
+# Commands use these as ${elbencho.…}, like ${mount.…}. Data written per client by Write =
+#   threads x dirs x files x file_size   (defaults: 32 x 1 x 8 x 4g = 1 TiB per client)
+# ---------------------------------------------------------------------
+elbencho:
+  dir: "${mount.mount_point}/elbencho/${client.name}"   # per-client folder on the mounted VAST view
+  threads: 32              # -t  I/O threads per client
+  dirs: 1                  # -n  directories per thread
+  files: 8                 # -N  files per directory
+  file_size: 4g            # -s  size of each file (k, m, g, t)
+  block_size: 1m           # -b  I/O size for the sequential write/read
+  flags: "--direct"        # extra flags for sequential write/read ("" = buffered I/O)
+  options: "-t ${elbencho.threads} -n ${elbencho.dirs} -N ${elbencho.files} -s ${elbencho.file_size} -b ${elbencho.block_size} ${elbencho.flags}"
+  # never write anywhere but the mounted VAST view (an unmounted mount point is just a local directory)
+  check_mount: 'mountpoint -q "${mount.mount_point}" || { echo "${mount.mount_point} is not mounted - run Mount NFSv3 first"; exit 1; }'
+  mkdir_command: 'mkdir -p "${elbencho.dir}"'
+  write_command: 'elbencho --nolive -w -d ${elbencho.options} "${elbencho.dir}"'
+  read_command: 'elbencho --nolive -r ${elbencho.options} "${elbencho.dir}"'
+  cleanup_command: 'elbencho --nolive -F -D -t ${elbencho.threads} -n ${elbencho.dirs} -N ${elbencho.files} "${elbencho.dir}"'
+  # Perf Test extras: random small-block IOPS on the written files, then a small-file metadata test
+  rand_block_size: 4k      # I/O size for the random write/read phases
+  rand_seconds: 60         # time limit for each random phase
+  rand_write_command: 'elbencho --nolive -w --rand -t ${elbencho.threads} -n ${elbencho.dirs} -N ${elbencho.files} -s ${elbencho.file_size} -b ${elbencho.rand_block_size} --direct --timelimit ${elbencho.rand_seconds} "${elbencho.dir}"'
+  rand_read_command: 'elbencho --nolive -r --rand -t ${elbencho.threads} -n ${elbencho.dirs} -N ${elbencho.files} -s ${elbencho.file_size} -b ${elbencho.rand_block_size} --direct --timelimit ${elbencho.rand_seconds} "${elbencho.dir}"'
+  md_dirs: 10              # metadata test: directories per thread
+  md_files: 1000           # metadata test: empty files per directory
+  md_options: "-t ${elbencho.threads} -n ${elbencho.md_dirs} -N ${elbencho.md_files}"
+  md_create_command: 'mkdir -p "${elbencho.dir}/md" && elbencho --nolive -d -w -s 0 ${elbencho.md_options} "${elbencho.dir}/md"'
+  md_stat_command: 'elbencho --nolive --stat ${elbencho.md_options} "${elbencho.dir}/md"'
+  md_delete_command: 'elbencho --nolive -F -D ${elbencho.md_options} "${elbencho.dir}/md" && rmdir "${elbencho.dir}/md"'
+
+  # Delete Perf Test Files: the client's whole benchmark folder (only inside <mount point>/elbencho/)
+  delete_command: 'case "${elbencho.dir}" in "${mount.mount_point}"/elbencho/?*) ;; *) echo "refusing to delete ${elbencho.dir}: not inside ${mount.mount_point}/elbencho/"; exit 1;; esac; if [ -d "${elbencho.dir}" ]; then echo "deleting ${elbencho.dir} ($(du -sh "${elbencho.dir}" | cut -f1))"; rm -rf -- "${elbencho.dir}" && echo "deleted"; else echo "nothing to delete: ${elbencho.dir} does not exist"; fi'
+  # Clear Linux Cache: flush dirty pages, then drop the page cache, dentries and inodes (needs root; presets use sudo)
+  drop_caches_command: 'echo "before:"; free -h | head -2; sync && echo 3 > /proc/sys/vm/drop_caches && echo "page cache, dentries and inodes dropped"; echo "after:"; free -h | head -2'
+
+# ---------------------------------------------------------------------
+# Required client packages (Tab 2 -> "Check packages")
+#   check     command that succeeds when the package is installed; first output line = version
+#   package   package name per package manager when it differs from "name"
+#   install   custom install command (used instead of the package manager); also used for "update"
+# ---------------------------------------------------------------------
+packages:
+  required:
+    - name: nano
+      check: command -v nano >/dev/null && nano --version | head -1   # 'cmd | head' alone would hide a missing cmd
+    - name: fio
+      check: fio --version
+    - name: nfs-utils
+      check: command -v mount.nfs >/dev/null && echo "mount.nfs present"
+      package: { apt: nfs-common, dnf: nfs-utils, yum: nfs-utils, zypper: nfs-client }
+    - name: elbencho
+      check: command -v elbencho >/dev/null && elbencho --version | head -1
+      # elbencho is not in the standard repos - install the static binary from GitHub releases.
+      # Point this at an internal mirror if the clients have no internet access.
+      install: 'curl -fsSL -o /tmp/elbencho.tar.gz https://github.com/breuner/elbencho/releases/latest/download/elbencho-static-$(uname -m).tar.gz && tar -xzf /tmp/elbencho.tar.gz -C /usr/local/bin && elbencho --version | head -1'
+    - name: vastnfs
+      # VAST NFS client driver (multipath "remoteports", NFS over RDMA). Built from source for the running
+      # kernel, as in https://docs.vastdata.com/docs/quickstart-multipathing-nfs-client-download-and-install
+      # Counted as present once the package is installed, so "Install missing" doesn't rebuild it before the
+      # reboot that loads it. "Check VAST driver version" shows whether it is actually loaded.
+      check: |
+        F=/sys/module/sunrpc/parameters/nfs_bundle_version
+        if [ -r $F ]; then echo "$(cat $F) (loaded)"; exit 0; fi
+        V=$(dpkg-query -W -f='${Version}\n' 'vastnfs*' 2>/dev/null | grep -v '^$' | head -1)
+        [ -z "$V" ] && V=$(rpm -q --qf '%{VERSION}' vastnfs 2>/dev/null | grep -v 'not installed')
+        [ -n "$V" ] && { echo "$V installed - reboot to load"; exit 0; }
+        echo "not installed"; exit 1
+      install_label: build and install the VAST NFS driver for this kernel (several minutes; no reboot)
+      install: |
+        set -e
+        # one install at a time per client, each in its own build folder
+        exec 9>/var/lock/vastnfs-install.lock
+        flock -n 9 || { echo "Another VAST NFS driver install is already running on this client - wait for it to finish."; exit 1; }
+        W=$(mktemp -d /tmp/vastnfs-build.XXXXXX); cd "$W"
+        echo "== 1/4 build prerequisites"
+        if command -v apt-get >/dev/null; then
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -q
+          apt-get install -y -q gcc make dpkg-dev debhelper autotools-dev "linux-headers-$(uname -r)" curl python3 xz-utils
+        elif command -v dnf >/dev/null; then
+          dnf install -y gcc make rpm-build "kernel-devel-$(uname -r)" curl python3 tar xz
+        else
+          yum install -y gcc make rpm-build "kernel-devel-$(uname -r)" curl python3 tar xz
+        fi
+        echo "== 2/4 download the VAST NFS source package"
+        curl -sSf https://vastnfs.vastdata.com/download.sh | bash -s
+        tar xf vastnfs-*.tar.xz
+        cd vastnfs-*/
+        echo "== 3/4 build for kernel $(uname -r)"
+        ./build.sh bin
+        ls -1 dist/
+        echo "== 4/4 install"
+        if command -v apt-get >/dev/null; then
+          apt-get install -y $(ls ./dist/*.deb | grep -v -e dbgsym -e debug)
+          depmod -a
+          update-initramfs -u -k "$(uname -r)"
+          dpkg-query -W -f='installed: ${Package} ${Version}\n' 'vastnfs*'
+        else
+          PKGS=$(ls ./dist/*.rpm | grep -v -e debuginfo -e debugsource -e '\.src\.rpm$')
+          if command -v dnf >/dev/null; then dnf install -y $PKGS; else yum install -y $PKGS; fi
+          depmod -a
+          dracut -f
+          rpm -qa 'vastnfs*' | sed 's/^/installed: /'
+        fi
+        echo "== REBOOT the client to load the driver, then click 'Check VAST driver version'"
+  package_managers:
+    apt:
+      install: apt-get update && apt-get install -y ${pkg.names}
+      update: apt-get update && apt-get install -y --only-upgrade ${pkg.names}
+      upgradable: apt list --upgradable 2>/dev/null
+    dnf:
+      install: dnf install -y ${pkg.names}
+      update: dnf upgrade -y ${pkg.names}
+      upgradable: dnf -q check-update
+    yum:
+      install: yum install -y ${pkg.names}
+      update: yum update -y ${pkg.names}
+      upgradable: yum -q check-update
+    zypper:
+      install: zypper --non-interactive install ${pkg.names}
+      update: zypper --non-interactive update ${pkg.names}
+      upgradable: zypper -q list-updates
+
+# ---------------------------------------------------------------------
+# Command execution
+# ---------------------------------------------------------------------
+execution:
+  delay_between_commands_seconds: 2   # pause between consecutive commands on a client
+  command_timeout_seconds: 3600
+  stop_on_error: true
+  parallel_clients: true              # run on all selected clients at the same time
+  use_pty: true                       # needed so commands can ask questions
+  # When a command prints a line matching this and then goes quiet, the console is flagged
+  # "waiting for your input" - type the answer in that console.
+  input_prompt_regex: '(\?\s*$|:\s*$|\[[yYnN]/[yYnN]\]|\([yYnN]/[yYnN]\)|password|passphrase|press (any key|enter)|continue)'
+  input_idle_seconds: 3
+
+# Preset command groups - each becomes a button in Tab 2.
+#   results: true  -> output is parsed for elbencho results and exported to JSON + TXT
+command_groups:
+  - id: precheck
+    label: Pre-check
+    commands:
+      - uname -r
+      - cat /etc/os-release | head -2
+
+  - id: vastnfs_version
+    label: Check VAST driver version
+    section: packages          # shown next to Check packages / Install missing / Update
+    sudo: false
+    commands:
+      - display: check the VAST NFS driver (installed package, loaded module)
+        run: |
+          F=/sys/module/sunrpc/parameters/nfs_bundle_version
+          echo "kernel:            $(uname -r)"
+          PKG=$(dpkg-query -W -f='${Package} ${Version}\n' 'vastnfs*' 2>/dev/null | grep -v ' $' | tr '\n' ' ')
+          [ -z "$PKG" ] && PKG=$(rpm -qa 'vastnfs*' 2>/dev/null | tr '\n' ' ')
+          echo "installed package: ${PKG:-none}"
+          if [ -r $F ]; then
+            echo "loaded driver:     VAST NFS $(cat $F)"
+            echo "sunrpc srcversion: loaded $(cat /sys/module/sunrpc/srcversion), on disk $(modinfo -F srcversion sunrpc 2>/dev/null)"
+            command -v vastnfs-ctl >/dev/null && vastnfs-ctl status
+            echo "RESULT: VAST NFS driver $(cat $F) is loaded"
+          elif [ -n "$PKG" ]; then
+            echo "loaded driver:     stock kernel NFS client"
+            echo "RESULT: installed but not loaded yet - reboot the client"; exit 1
+          else
+            echo "loaded driver:     stock kernel NFS client"
+            echo "RESULT: VAST NFS driver not installed - use Install missing"; exit 1
+          fi
+
+  - id: ping_vip
+    label: Ping VIP
+    sudo: false
+    commands:
+      # 5 pings to the first IP of this site's tenant VIP pool, then stop
+      - ping -c 5 ${tenant_vip.start}
+
+  - id: mount
+    label: Mount NFSv3
+    commands:
+      - mkdir -p ${mount.mount_point}
+      - ${mount.command}
+      - mount | grep " ${mount.mount_point} "
+
+  - id: readahead
+    label: Set read-ahead
+    commands:
+      - ${mount.read_ahead_command}
+
+  - id: elbencho_write
+    label: Elbencho Write
+    results: true
+    commands:
+      - ${elbencho.check_mount}
+      - ${elbencho.mkdir_command}
+      - ${elbencho.write_command}
+
+  - id: elbencho_read
+    label: Elbencho Read
+    results: true
+    commands:                 # reads the files that Elbencho Write left behind
+      - ${elbencho.check_mount}
+      - ${elbencho.read_command}
+
+  - id: elbencho                # (kept this id so older results stay linked)
+    label: Elbencho Auto Read/Write
+    results: true
+    delay_between_commands_seconds: 5
+    commands:                 # write, read back, delete
+      - ${elbencho.check_mount}
+      - ${elbencho.mkdir_command}
+      - ${elbencho.write_command}
+      - ${elbencho.read_command}
+      - ${elbencho.cleanup_command}
+
+  - id: perf_test
+    label: Perf Test
+    results: true
+    delay_between_commands_seconds: 5
+    commands:                 # throughput, random IOPS, metadata, then delete everything it wrote
+      - ${elbencho.check_mount}
+      - ${elbencho.mkdir_command}
+      - ${elbencho.write_command}
+      - ${elbencho.read_command}
+      - ${elbencho.rand_write_command}
+      - ${elbencho.rand_read_command}
+      - ${elbencho.cleanup_command}
+      - ${elbencho.md_create_command}
+      - ${elbencho.md_stat_command}
+      - ${elbencho.md_delete_command}
+
+  - id: elbencho_delete
+    label: Delete Perf Test Files
+    results: false
+    confirm: Deletes all elbencho / Perf Test files of the ticked clients on the VAST view (each client's folder under <mount point>/elbencho/). This cannot be undone.
+    commands:
+      - ${elbencho.check_mount}
+      - ${elbencho.delete_command}
+
+  - id: drop_caches
+    label: Clear Linux Cache
+    commands:
+      - ${elbencho.drop_caches_command}
+
+  - id: unmount
+    label: Unmount
+    commands:
+      - umount ${mount.mount_point}

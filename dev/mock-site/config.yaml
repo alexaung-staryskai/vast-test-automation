@@ -1,0 +1,381 @@
+# Mock test site. Start the mocks: uvicorn dev.mock_vms:app --port 9443; python dev/mock_ssh.py 2222; python dev/mock_ssh.py 2223
+# then ./run.sh dev/mock-site
+app:
+  host: 127.0.0.1
+  port: 8090
+  results_dir: results
+  tenants_file: tenants.yaml
+  store_secrets: false
+vms:
+  url: http://127.0.0.1:9443
+  api_base: /api/v8
+  auth_type: api_token
+  api_token: mock-token
+  username: ''
+  password: ''
+  token_endpoint: /token/
+  verify_ssl: false
+  timeout_seconds: 30
+  health_endpoint: /clusters/
+vars:
+  tenant_name: perf-tenant-01
+  tenant_admin_username: ${vars.tenant_name}-admin
+  tenant_admin_password: ''
+  tenant_admin_role: ${vars.tenant_name}-admin-role
+  vip_pool_name: vip-${vars.tenant_name}
+  quota_name: quota-${vars.tenant_name}
+  quota_hard_limit: 10 TB
+  quota_soft_limit: 0 TB
+  qos_name: qos-${vars.tenant_name}
+  qos_read_limit: 500 MB/s
+  qos_write_limit: 1 GB/s
+  s3_user_name: ${vars.tenant_name}-s3
+  view_policy_name: vp-${vars.tenant_name}
+  view_policy_flavor: MIXED_LAST_WINS
+  view_name: ${vars.tenant_name}-default-view
+  view_path: /${vars.tenant_name}-default-view
+  view_protocols:
+  - NFS
+  - S3
+  bucket_name: ${vars.tenant_name}-default-view
+vip_pool:
+  ranges:
+  - start: 10.20.0.10
+    end: 10.20.0.250
+  ip_count: 5
+  subnet_cidr: 16
+  gateway: ''
+  vlan: 0
+  role: PROTOCOLS
+  ping_check: false
+tenant_admin:
+  user_type: TENANT_ADMIN
+  password_length: 16
+  role_permissions:
+  - create_applications
+  - create_database
+  - create_events
+  - create_hardware
+  - create_logical
+  - create_monitoring
+  - create_security
+  - create_settings
+  - create_support
+  - delete_applications
+  - delete_database
+  - delete_events
+  - delete_hardware
+  - delete_logical
+  - delete_monitoring
+  - delete_security
+  - delete_settings
+  - delete_support
+  - edit_applications
+  - edit_database
+  - edit_events
+  - edit_hardware
+  - edit_logical
+  - edit_monitoring
+  - edit_security
+  - edit_settings
+  - edit_support
+  - view_applications
+  - view_database
+  - view_events
+  - view_hardware
+  - view_logical
+  - view_monitoring
+  - view_security
+  - view_settings
+  - view_support
+provisioning:
+  on_existing: fail
+  continue_on_error: false
+  steps:
+  - id: vip
+    name: Check VIP pool range & pick free IPs
+    type: vip_check
+  - id: tenant
+    name: Create tenant
+    method: POST
+    endpoint: /tenants/
+    exists_by: name
+    body:
+      name: ${vars.tenant_name}
+    verify:
+      endpoint: /tenants/${tenant.id}/
+      expect:
+        name: ${vars.tenant_name}
+    cleanup:
+      method: DELETE
+      endpoint: /tenants/${tenant.id}/
+  - id: admin_role
+    name: Create tenant admin role
+    method: POST
+    endpoint: /roles/
+    exists_by: name
+    body:
+      name: ${vars.tenant_admin_role}
+      tenant_id: ${tenant.id}
+      permissions_list: ${cfg.tenant_admin.role_permissions}
+    verify:
+      endpoint: /roles/${admin_role.id}/
+      expect:
+        name: ${vars.tenant_admin_role}
+    cleanup:
+      method: DELETE
+      endpoint: /roles/${admin_role.id}/
+  - id: tenant_admin
+    name: Create tenant admin
+    method: POST
+    endpoint: /managers/
+    exists_by: username
+    body:
+      username: ${vars.tenant_admin_username}
+      password: ${vars.tenant_admin_password}
+      first_name: ${vars.tenant_name}
+      last_name: admin
+      user_type: ${cfg.tenant_admin.user_type}
+      tenant_id: ${tenant.id}
+      roles:
+      - ${admin_role.id}
+    verify:
+      endpoint: /managers/${tenant_admin.id}/
+      expect:
+        username: ${vars.tenant_admin_username}
+    cleanup:
+      method: DELETE
+      endpoint: /managers/${tenant_admin.id}/
+  - id: vippool
+    name: Create VIP pool
+    method: POST
+    endpoint: /vippools/
+    exists_by: name
+    body:
+      name: ${vars.vip_pool_name}
+      ip_ranges:
+      - - ${vip.start}
+        - ${vip.end}
+      subnet_cidr: ${cfg.vip_pool.subnet_cidr}
+      role: ${cfg.vip_pool.role}
+      tenant_id: ${tenant.id}
+      gw_ip: ${cfg.vip_pool.gateway}
+      vlan: ${cfg.vip_pool.vlan}
+    omit_if_empty:
+    - gw_ip
+    - vlan
+    verify:
+      endpoint: /vippools/${vippool.id}/
+      expect:
+        name: ${vars.vip_pool_name}
+    cleanup:
+      method: DELETE
+      endpoint: /vippools/${vippool.id}/
+  - id: quota
+    name: Create quota (creates the view directory)
+    method: POST
+    endpoint: /quotas/
+    exists_by: name
+    body:
+      name: ${vars.quota_name}
+      path: ${vars.view_path}
+      hard_limit: ${vars.quota_hard_limit_bytes}
+      soft_limit: ${vars.quota_soft_limit_bytes}
+      tenant_id: ${tenant.id}
+      create_dir: true
+    omit_if_empty:
+    - soft_limit
+    verify:
+      endpoint: /quotas/${quota.id}/
+      expect:
+        hard_limit: ${vars.quota_hard_limit_bytes}
+    cleanup:
+      method: DELETE
+      endpoint: /quotas/${quota.id}/
+  - id: qos
+    name: Create QoS policy
+    method: POST
+    endpoint: /qospolicies/
+    exists_by: name
+    body:
+      name: ${vars.qos_name}
+      mode: STATIC
+      policy_type: VIEW
+      tenant_id: ${tenant.id}
+      static_limits:
+        max_reads_bw_mbps: ${vars.qos_read_limit_mbps}
+        max_writes_bw_mbps: ${vars.qos_write_limit_mbps}
+    verify:
+      endpoint: /qospolicies/${qos.id}/
+      expect:
+        name: ${vars.qos_name}
+    cleanup:
+      method: DELETE
+      endpoint: /qospolicies/${qos.id}/
+  - id: s3_user
+    name: Create S3 user (tenant local provider)
+    method: POST
+    endpoint: /users/
+    exists_by: name
+    body:
+      name: ${vars.s3_user_name}
+      local_provider_id: ${tenant.local_provider_id}
+      allow_create_bucket: true
+    verify:
+      endpoint: /users/${s3_user.id}/
+      expect:
+        name: ${vars.s3_user_name}
+    cleanup:
+      method: DELETE
+      endpoint: /users/${s3_user.id}/
+  - id: s3_keys
+    name: Generate S3 access key
+    method: POST
+    endpoint: /users/${s3_user.id}/access_keys/
+    body:
+      tenant_id: ${tenant.id}
+  - id: view_policy
+    name: Create view policy (bound to VIP pool)
+    method: POST
+    endpoint: /viewpolicies/
+    exists_by: name
+    body:
+      name: ${vars.view_policy_name}
+      tenant_id: ${tenant.id}
+      flavor: ${vars.view_policy_flavor}
+      permission_per_vip_pool:
+        ${vippool.id}: RW
+      nfs_read_write:
+      - '*'
+      nfs_root_squash:
+      - '*'
+      nfs_no_squash: []
+      s3_read_write:
+      - '*'
+    verify:
+      endpoint: /viewpolicies/${view_policy.id}/
+      expect:
+        name: ${vars.view_policy_name}
+    cleanup:
+      method: DELETE
+      endpoint: /viewpolicies/${view_policy.id}/
+  - id: view
+    name: Create view (NFS + S3 bucket, QoS)
+    method: POST
+    endpoint: /views/
+    exists_by: name
+    body:
+      name: ${vars.view_name}
+      path: ${vars.view_path}
+      protocols: ${vars.view_protocols}
+      policy_id: ${view_policy.id}
+      tenant_id: ${tenant.id}
+      qos_policy_id: ${qos.id}
+      create_dir: false
+      bucket: ${vars.bucket_name}
+      bucket_owner: ${vars.s3_user_name}
+    verify:
+      endpoint: /views/${view.id}/
+      expect:
+        path: ${vars.view_path}
+        policy_id: ${view_policy.id}
+    cleanup:
+      method: DELETE
+      endpoint: /views/${view.id}/
+ssh:
+  username: root
+  password: test
+  port: 2222
+  use_sudo: auto
+  connect_timeout_seconds: 5
+  connect_retries: 2
+  idle_close_minutes: 60  # consoles stay open when the page is reloaded/closed; close them after this many minutes with no page showing them (0 = never)
+clients:
+- name: client-01
+  host: 127.0.0.1
+  port: 2222
+- name: client-02
+  host: 127.0.0.1
+  port: 2223
+  username: ubuntu
+mount:
+  mount_point: /mnt/vast
+  export_path: ${vars.view_path}
+  vip: auto
+  options: vers=3,proto=tcp,nconnect=16,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noatime,nodiratime,lookupcache=positive
+  command: mount -t nfs -o ${mount.options} ${client.vip}:${mount.export_path} ${mount.mount_point}
+  read_ahead_kb: 16384
+  read_ahead_command: DEV=$(mountpoint -d ${mount.mount_point}) && echo ${mount.read_ahead_kb} > /sys/class/bdi/$DEV/read_ahead_kb && echo "read_ahead_kb for $DEV = $(cat /sys/class/bdi/$DEV/read_ahead_kb)"
+packages:
+  required:
+  - name: nano
+    check: nano --version | head -1
+  - name: fio
+    check: fio --version
+  - name: nfs-utils
+    check: command -v mount.nfs >/dev/null && echo "mount.nfs present"
+    package:
+      apt: nfs-common
+      dnf: nfs-utils
+      yum: nfs-utils
+      zypper: nfs-client
+  - name: elbencho
+    check: elbencho --version | head -1
+    install: curl -fsSL -o /tmp/elbencho.tar.gz https://github.com/breuner/elbencho/releases/latest/download/elbencho-static-$(uname -m).tar.gz && tar -xzf /tmp/elbencho.tar.gz -C /usr/local/bin && elbencho
+      --version | head -1
+  package_managers:
+    apt:
+      install: apt-get update && apt-get install -y ${pkg.names}
+      update: apt-get update && apt-get install -y --only-upgrade ${pkg.names}
+      upgradable: apt list --upgradable 2>/dev/null
+    dnf:
+      install: dnf install -y ${pkg.names}
+      update: dnf upgrade -y ${pkg.names}
+      upgradable: dnf -q check-update
+    yum:
+      install: yum install -y ${pkg.names}
+      update: yum update -y ${pkg.names}
+      upgradable: yum -q check-update
+    zypper:
+      install: zypper --non-interactive install ${pkg.names}
+      update: zypper --non-interactive update ${pkg.names}
+      upgradable: zypper -q list-updates
+execution:
+  delay_between_commands_seconds: 1
+  command_timeout_seconds: 3600
+  stop_on_error: true
+  parallel_clients: true
+  use_pty: true
+  input_prompt_regex: (\?\s*$|:\s*$|\[[yYnN]/[yYnN]\]|\([yYnN]/[yYnN]\)|password|passphrase|press (any key|enter)|continue)
+  input_idle_seconds: 3
+command_groups:
+- id: precheck
+  label: Pre-check
+  commands:
+  - uname -r
+  - cat /etc/os-release | head -2
+- id: mount
+  label: Mount NFSv3
+  commands:
+  - mkdir -p ${mount.mount_point}
+  - ${mount.command}
+  - mount | grep " ${mount.mount_point} "
+- id: readahead
+  label: Set read-ahead
+  commands:
+  - ${mount.read_ahead_command}
+- id: elbencho
+  label: Run elbencho
+  results: true
+  delay_between_commands_seconds: 5
+  commands:
+  # refuse to write anywhere but the mounted VAST view (an unmounted mount point is a local directory)
+  - mountpoint -q "${mount.mount_point}" || { echo "${mount.mount_point} is not mounted - run Mount NFSv3 first"; exit 1; }
+  - mkdir -p "${mount.mount_point}/elbencho/${client.name}"
+  - elbencho --nolive -w -d -t 32 -n 1 -N 8 -s 4g -b 1m --direct "${mount.mount_point}/elbencho/${client.name}"
+  - elbencho --nolive -r -t 32 -n 1 -N 8 -s 4g -b 1m --direct "${mount.mount_point}/elbencho/${client.name}"
+  - elbencho --nolive -F -D -t 32 -n 1 -N 8 "${mount.mount_point}/elbencho/${client.name}"
+- id: unmount
+  label: Unmount
+  commands:
+  - umount ${mount.mount_point}
