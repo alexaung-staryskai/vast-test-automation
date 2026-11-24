@@ -269,6 +269,7 @@ def get_config() -> dict:
                     for cl in c["clients"]],
         "groups": [{"id": g["id"], "label": g.get("label", g["id"]), "results": bool(g.get("results")),
                     "section": g.get("section", "presets"),   # "packages" puts the button in Required packages
+                    "menu": g.get("menu"),                     # Presets dropdown it sits in (none -> Customs)
                     "confirm": g.get("confirm"),               # ask before running (e.g. deletes)
                     "commands": g.get("commands", []),
                     "delay": g.get("delay_between_commands_seconds",
@@ -334,6 +335,209 @@ def put_config_raw(body: RawIn) -> dict:
 def put_config_data(body: DataIn) -> dict:
     _not_stale(body.base_mtime)
     return _after_save(config_store.save_data(config_path(), body.data))
+
+
+# ---- Custom Linux commands (⚙ Configuration) -> Presets → Customs ----
+def _custom_view(g: dict) -> dict:
+    """One custom preset as the editor shows it: one command per line, or one script."""
+    cmds = g.get("commands") or []
+    out = {"id": g.get("id"), "label": g.get("label", g.get("id")), "sudo": g.get("sudo", True) is not False,
+           "confirm": g.get("confirm") or "", "results": bool(g.get("results")), "editable": True}
+    if all(isinstance(c, str) and "\n" not in c.strip() for c in cmds):
+        out.update(mode="lines", text="\n".join(cmds))
+    elif len(cmds) == 1 and (isinstance(cmds[0], str) or (isinstance(cmds[0], dict) and set(cmds[0]) <= {"run", "display"})):
+        out.update(mode="script", text=(cmds[0] if isinstance(cmds[0], str) else cmds[0].get("run", "")).rstrip("\n"))
+    else:                                   # e.g. per-command display names or other keys: edit it as YAML
+        import yaml
+        out.update(mode="yaml", editable=False, text=yaml.safe_dump(cmds, sort_keys=False, allow_unicode=True))
+    known = {"id", "label", "menu", "sudo", "confirm", "results", "commands"}
+    if set(g) - known:                      # options the editor doesn't know about: keep the entry as it is
+        out["editable"] = False
+        out["extra"] = sorted(set(g) - known)
+    return out
+
+
+@app.get("/api/custom-commands")
+def get_custom_commands() -> dict:
+    raw = config_store.read_raw(config_path())
+    groups = (raw["data"] or {}).get("command_groups") or []
+    return {"mtime": raw["mtime"], "commands": [_custom_view(g) for g in groups if config_store.is_custom_group(g)]}
+
+
+class CustomCmdIn(BaseModel):
+    id: str | None = None
+    label: str = ""
+    mode: str = "lines"          # lines: every line is its own command · script: the whole text runs as one script
+    text: str = ""
+    sudo: bool = False
+    confirm: str = ""            # non-empty: ask before running, with this message
+    results: bool = False        # parse elbencho output and save it as a performance result
+    keep: bool = False           # leave this entry exactly as it is in config.yaml
+
+
+class CustomCmdsIn(BaseModel):
+    commands: list[CustomCmdIn]
+    base_mtime: float | None = None
+
+
+def _slug(label: str) -> str:
+    import re
+    return re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")[:40] or "command"
+
+
+@app.put("/api/custom-commands")
+def put_custom_commands(body: CustomCmdsIn) -> dict:
+    _not_stale(body.base_mtime)
+    raw = config_store.read_raw(config_path())
+    all_groups = (raw["data"] or {}).get("command_groups") or []
+    taken = {g.get("id") for g in all_groups if not config_store.is_custom_group(g)}
+    errors, groups, labels = [], [], set()
+    for n, c in enumerate(body.commands, 1):
+        if c.keep:
+            if not c.id:
+                errors.append(f"Command {n}: missing id")
+            else:
+                groups.append({"id": c.id, "keep": True}); taken.add(c.id)
+            continue
+        label = c.label.strip()
+        lines = [ln.rstrip() for ln in c.text.replace("\r\n", "\n").split("\n")]
+        if not label:
+            errors.append(f"Command {n}: give it a name")
+        elif label.lower() in labels:
+            errors.append(f"Two commands are called \"{label}\" - names must be unique")
+        labels.add(label.lower())
+        if not any(ln.strip() for ln in lines):
+            errors.append(f"\"{label or f'Command {n}'}\": enter at least one Linux command")
+        if c.mode not in ("lines", "script"):
+            errors.append(f"\"{label}\": unknown mode {c.mode}")
+        gid = c.id if c.id and c.id not in taken else None
+        if not gid:
+            base = "custom_" + _slug(label)
+            gid, k = base, 2
+            while gid in taken:
+                gid, k = f"{base}_{k}", k + 1
+        taken.add(gid)
+        if c.mode == "script":
+            script = "\n".join(lines).strip("\n") + "\n"
+            cmds = [{"display": label, "run": script}]
+        else:
+            cmds = [ln.strip() for ln in lines if ln.strip()]
+        g = {"id": gid, "label": label, "menu": "Customs"}
+        if not c.sudo:
+            g["sudo"] = False
+        if c.confirm.strip():
+            g["confirm"] = c.confirm.strip()
+        if c.results:
+            g["results"] = True
+        g["commands"] = cmds
+        groups.append(g)
+    if errors:
+        raise HTTPException(400, {"errors": errors})
+    res = _after_save(config_store.save_custom_groups(config_path(), groups))
+    return {**res, **get_custom_commands()}
+
+
+# ---- export / import of custom Linux commands (a small YAML file, readable and diff-able) ----
+CC_FORMAT = "vast-test-bench/custom-commands"
+
+
+class CustomExportIn(BaseModel):
+    commands: list[CustomCmdIn]
+
+
+@app.post("/api/custom-commands/export")
+def export_custom_commands(body: CustomExportIn) -> dict:
+    """The editor's current list (unsaved edits included) as a YAML file the Import button reads back."""
+    import io
+    from datetime import datetime
+    from ruamel.yaml.comments import CommentedMap
+    from ruamel.yaml.scalarstring import LiteralScalarString
+    items = []
+    for c in body.commands:
+        if c.keep:
+            continue                               # hand-written entries the editor can't show are not exported
+        m = CommentedMap()
+        m["name"] = c.label.strip()
+        m["mode"] = "script" if c.mode == "script" else "lines"
+        text = c.text.replace("\r\n", "\n").strip("\n")
+        m["commands"] = LiteralScalarString(text + "\n") if "\n" in text else text
+        m["sudo"] = bool(c.sudo)
+        if c.confirm.strip():
+            m["ask_before_running"] = c.confirm.strip()
+        if c.results:
+            m["save_elbencho_results"] = True
+        items.append(m)
+    site = state.site.name if state.site else "site"
+    doc = CommentedMap()
+    doc["format"] = CC_FORMAT
+    doc["version"] = 1
+    doc["exported_from"] = site
+    doc["exported_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    doc["commands"] = items
+    buf = io.StringIO()
+    buf.write("# VAST Test Bench - custom Linux commands.\n"
+              "# Import: ⚙ Configuration → Custom Linux commands → Import. They show under Presets → Customs.\n"
+              "#   mode: lines  -> every line of commands is its own command, run in order\n"
+              "#   mode: script -> commands runs as one bash script\n")
+    config_store._rt().dump(doc, buf)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    return {"filename": f"custom-commands-{_slug(site).replace('_', '-')}-{stamp}.yaml", "text": buf.getvalue(),
+            "count": len(items), "skipped": sum(1 for c in body.commands if c.keep)}
+
+
+class CustomImportIn(BaseModel):
+    text: str
+
+
+@app.post("/api/custom-commands/import")
+def import_custom_commands(body: CustomImportIn) -> dict:
+    """Parse an exported file (or a list of command_groups entries copied from a config.yaml) into editor items.
+    Nothing is saved here: the page adds them to the editor and the user reviews them, then clicks Save."""
+    import yaml
+    if len(body.text) > 1_000_000:
+        raise HTTPException(400, {"errors": ["The file is too large (over 1 MB) for a list of commands."]})
+    try:
+        data = yaml.safe_load(body.text)
+    except yaml.YAMLError as e:
+        raise HTTPException(400, {"errors": [f"Not a valid YAML/JSON file: {e}"]})
+    if isinstance(data, dict):
+        fmt = data.get("format")
+        if fmt and fmt != CC_FORMAT:
+            raise HTTPException(400, {"errors": [f"Unknown file format '{fmt}' - expected a custom commands export."]})
+        raw = data.get("commands") if "commands" in data and fmt else data.get("command_groups")
+    else:
+        raw = data
+    if not isinstance(raw, list):
+        raise HTTPException(400, {"errors": ["No commands found. Expected a file exported from Custom Linux commands "
+                                             "(format: vast-test-bench/custom-commands)."]})
+    items, skipped = [], []
+    for n, it in enumerate(raw, 1):
+        if not isinstance(it, dict):
+            skipped.append(f"entry {n}: not a mapping"); continue
+        if "name" in it:                               # our export format
+            text = it.get("commands", "")
+            if isinstance(text, list):
+                text = "\n".join(str(x) for x in text)
+            mode = it.get("mode", "lines")
+            if mode not in ("lines", "script"):
+                skipped.append(f"{it['name']}: unknown mode {mode}"); continue
+            if not str(it["name"]).strip() or not str(text).strip():
+                skipped.append(f"entry {n}: needs a name and commands"); continue
+            items.append({"id": None, "label": str(it["name"]).strip()[:60], "mode": mode, "text": str(text).rstrip("\n"),
+                          "sudo": bool(it.get("sudo", False)), "confirm": str(it.get("ask_before_running") or ""),
+                          "results": bool(it.get("save_elbencho_results", False)), "editable": True})
+        elif "commands" in it:                         # a command_groups entry copied from a config.yaml
+            if it.get("id") in config_store.BUILTIN_GROUPS or it.get("section") == "packages":
+                skipped.append(f"{it.get('label', it.get('id'))}: built-in preset"); continue
+            v = _custom_view(it)
+            if not v["editable"]:
+                skipped.append(f"{v['label']}: uses options the editor can't show - add it in the YAML view"); continue
+            items.append({**v, "id": None})
+        else:
+            skipped.append(f"entry {n}: no name/commands")
+    if not items and not skipped:
+        raise HTTPException(400, {"errors": ["The file has no commands."]})
+    return {"commands": items, "skipped": skipped}
 
 
 @app.post("/api/config/validate")

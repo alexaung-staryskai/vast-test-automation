@@ -136,7 +136,7 @@ function renderChart() {
   if (!CHART.sessions.length || !nPh) {
     wrap.hidden = true; empty.hidden = false;
     empty.textContent = !CHART.sessions.length
-      ? "No performance runs yet. Run Elbencho Write, Read or Auto Read/Write in tab ② and they appear here."
+      ? "No performance runs yet. Run Elbencho Write, Read or Auto Write/Read (Presets → Performance Test) in tab ② and they appear here."
       : "All test sessions or series are hidden. Tick a session on the right (or a series above) to show it.";
     renderChartTable(); return;
   }

@@ -175,7 +175,7 @@ Last updated: 2026-11-24.
   - Use `proto=rdma,port=20049` only on clients with an RDMA NIC. `20049` is the RDMA port; NFS over TCP is 2049.
   - Sites created before this change keep whatever their own `config.yaml` says (both current sites already use the default above).
 - **Why.** The test VMs have no RDMA device (mount gives "Protocol error"). `proto=tcp,port=20049` hangs, because nothing listens for TCP on that port.
-- **Stale mounts.** **Mount NFSv3** first unmounts whatever is still mounted at the mount point (forced, then lazy). **Unmount** tries normal, then forced, then lazy.
+- **Stale mounts.** **Mount NFS** first unmounts whatever is still mounted at the mount point (forced, then lazy). **Unmount** tries normal, then forced, then lazy.
   - **Why:** a tenant and its view were deleted on the VMS while the clients still had the view mounted. After that, anything touching the mount point failed with "Stale file handle", including the next site's `mkdir`. That blocked mounting the new tenant.
   - **Practice:** run **Unmount** on the clients before deleting a tenant or view, or before **🧹 Cleanup**.
 
@@ -186,11 +186,11 @@ Last updated: 2026-11-24.
 - **Buttons:**
   - **Elbencho Write** (files are left for Read);
   - **Elbencho Read**;
-  - **Elbencho Auto Read/Write** (write → read → delete; keeps the old `elbencho` id so older results stay linked);
+  - **Elbencho Auto Write/Read** (write → read → delete; keeps the old `elbencho` id so older results stay linked);
   - **Delete Elbencho Files** (asks first);
   - **Clear Linux Cache** (`sync; echo 3 > /proc/sys/vm/drop_caches`, with `free -h` before and after);
-  - **Ping VIP** (`ping -c 5 ${tenant_vip.start}`).
-  - **Client Info** (read-only, no sudo): OS and version, kernel, VAST NFS driver (loaded, or installed and waiting for a reboot), CPU count and model, RAM, and per network interface its IPv4 address(es), link speed, state and MTU. Virtual NICs (e.g. virtio on QEMU) report no link speed; that shows as "speed n/a (virtual NIC)".
+  - **Ping VMS with VIP** (`ping -c 5 ${tenant_vip.start}`).
+  - **Client info** (read-only, no sudo): OS and version, kernel, VAST NFS driver (loaded, or installed and waiting for a reboot), CPU count and model, RAM, and per network interface its IPv4 address(es), link speed, state and MTU. Virtual NICs (e.g. virtio on QEMU) report no link speed; that shows as "speed n/a (virtual NIC)".
   - **Mount Status** (read-only, no sudo): what is mounted at the mount point (source, type, options), whether it is this site's tenant view, whether it responds (`stat` with a 5 s timeout, so a stale mount is reported instead of hanging), and usage. The run fails when nothing is mounted or the mount doesn't respond.
 - **Safety.**
   - **Quoted paths:** every benchmark path is quoted.
@@ -199,6 +199,40 @@ Last updated: 2026-11-24.
   - **Why:** an unquoted client name with spaces (`test auto vm 01`) split the path, and elbencho wrote about 20 GB to each VM's **local** root disk, which filled it to 100%.
 - **Perf Test removed.** It was a combined throughput + random IOPS + metadata suite. It was removed at the user's request, together with its settings (`rand_*`, `md_*`).
 - **Known behaviour.** `--nolive` prints nothing until a phase ends, so long phases look idle. Defaults write 1 TiB per client (32 × 1 × 8 × 4 GiB).
+
+### Presets dropdown menus
+- **Decision.** The Presets card shows one dropdown per menu instead of a row of buttons:
+  - **Client Cmds**: Pre-checks, Client info;
+  - **Connection**: Ping VMS with VIP;
+  - **File System**: Mount NFS, Mount Status, Set Read-ahead, Unmount;
+  - **Performance Test** (highlighted): Elbencho Write, Elbencho Read, Elbencho Auto Write/Read;
+  - **Utilities**: Delete Elbencho Files, Clear Linux Cache (Delete is shown in red and still asks first);
+  - **Customs**: every preset with `menu: Customs`, or without a `menu:` key that isn't built in. When there are none it links to the editor below.
+- **How.** Each `command_groups` entry takes an optional `menu: <name>`. A name that isn't one of the five adds its own dropdown before Customs. Items keep their config order. Sites created earlier without `menu:` keys still group correctly: the page falls back to the built-in id → menu map.
+- **Renamed labels** (ids unchanged, so results and logs stay linked): Pre-check → Pre-checks, Client Info → Client info, Ping VIP → Ping VMS with VIP, Mount NFSv3 → Mount NFS, Set read-ahead → Set Read-ahead, Elbencho Auto Read/Write → Elbencho Auto Write/Read.
+- **Keyboard.** Enter/Space opens a menu, ↑/↓ moves, Esc closes; a click outside closes it.
+
+### Custom Linux commands (⚙ Configuration)
+- **Decision.** The Configuration tab has a **Custom Linux commands** card (the last card in the tab; it folds to its title bar like Required packages and Presets, and the choice is remembered) to create, edit, reorder and delete the user's own presets. Each one appears under **Presets → Customs** right after **💾 Save commands**.
+- **Per command:**
+  - **Name**: the label in the Customs menu (required, unique);
+  - **One command per line** (each line is its own command, run in order, stops at the first failure) or **One script** (the whole text runs as one bash script, for `if`/`for`/variables);
+  - **Run with sudo** (off by default), **Ask before running** (with an editable message), **Save elbencho results** (parse the output as a performance run).
+  - Template values work as in the built-in presets (`${mount.mount_point}`, `${tenant_vip.start}`, `${client.name}`, …).
+- **Storage.** They are ordinary `command_groups` entries with `menu: Customs` and an id `custom_<name>`, in the site's `config.yaml`. Custom entries written by hand that the card can't show (other keys, per-command display names) are listed read-only and kept exactly as they are.
+- **Saving touches only the custom entries.**
+  - It rewrites only the `command_groups` block; every other line of `config.yaml` stays byte-for-byte the same.
+  - Comments on the built-in presets are kept; deleting all custom commands gives back the original file.
+  - It backs up the previous file (`config-backups/`) like every config save.
+- **Why a separate card (not the generic form):** the generic form replaces the whole `command_groups` list when an item is removed, which drops every comment in it, and it shows commands as raw JSON/YAML.
+- **Conflicts.** Saves carry the file's modification time; if `config.yaml` changed in the meantime (another tab, the full editor, a hand edit), nothing is saved and the card says so. After a custom save the full editor reloads, unless it has unsaved edits, in which case it warns to Revert first.
+- **Export / Import.**
+  - **⤓ Export** downloads the card's current list (unsaved edits included) as `custom-commands-<site>-<date>.yaml`: a small, readable file (`format: vast-test-bench/custom-commands`, `version: 1`, then per command `name`, `mode`, `commands`, `sudo` and optionally `ask_before_running` / `save_elbencho_results`). Hand-written entries the card can't show are not exported.
+  - **⤒ Import** reads such a file (from this or another site), or a `command_groups:` list copied from a config.yaml (built-in presets in it are skipped). Nothing is saved on import: the commands are added to the card as unsaved changes, to be reviewed before **💾 Save commands**, because they run on the clients.
+  - **Same name:** the page asks **Replace existing** (keeps the existing id, so its logs and results stay linked) or **Keep both** (adds "name (2)").
+  - Bad files (not YAML/JSON, unknown `format`, no commands, over 1 MB) are rejected with a message.
+- **Site switch.** Opening another test site reloads the card for that site (it used to keep showing the previous site's commands, and a save then failed as "changed after you opened it").
+- **Menu look.** Red stays reserved for built-in destructive presets (Delete Elbencho Files). A custom command that asks first shows "…" after its name.
 
 ### Performance results
 - **Decision.**

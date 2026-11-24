@@ -3,6 +3,7 @@ Saves keep comments and ordering (ruamel round-trip) and back up the previous fi
 from __future__ import annotations
 
 import io
+import re
 import shutil
 import time
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Any
 import yaml
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
+from ruamel.yaml.scalarstring import LiteralScalarString
 
 REQUIRED = {"vms": dict, "vars": dict, "provisioning": dict, "clients": list, "command_groups": list}
 
@@ -143,6 +145,100 @@ def save_data(path: Path, data: dict) -> dict:
         return {"ok": False, "errors": [f"Internal error: the updated config would not be valid YAML ({e}). Nothing was written."]}
     if reread != data:
         return {"ok": False, "errors": ["Internal error: the updated config did not round-trip. Nothing was written."]}
+    backup = _backup(path)
+    path.write_text(text)
+    return {"ok": True, "backup": backup}
+
+
+# ------------------------------------------------------------------ custom Linux commands
+# Presets the user adds in ⚙ Configuration → Custom Linux commands. They live in command_groups like the
+# built-in presets and show under Presets → Customs. A group counts as custom when it says menu: Customs,
+# or has no menu: and is not one of the built-in presets.
+BUILTIN_GROUPS = {"precheck", "client_info", "vastnfs_version", "ping_vip", "mount", "mount_status", "readahead",
+                  "unmount", "elbencho_write", "elbencho_read", "elbencho", "elbencho_delete", "drop_caches"}
+
+
+def is_custom_group(g: Any) -> bool:
+    if not isinstance(g, dict):
+        return False
+    if g.get("menu"):
+        return str(g["menu"]).strip().lower() == "customs"
+    return g.get("id") not in BUILTIN_GROUPS and g.get("section", "presets") != "packages"
+
+
+def _literal(v: Any) -> Any:
+    """Multi-line strings (scripts) are written as YAML block scalars (|), like the built-in presets."""
+    if isinstance(v, str) and "\n" in v:
+        return LiteralScalarString(v)
+    if isinstance(v, dict):
+        return {k: _literal(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_literal(x) for x in v]
+    return v
+
+
+def save_custom_groups(path: Path, groups: list[dict]) -> dict:
+    """Replace the custom presets in command_groups with `groups` (in that order), touching nothing else.
+
+    Each entry is a full group dict, or {"id": ..., "keep": True} to leave that existing group exactly as it is
+    (custom groups written by hand that the editor cannot show). The customs go where the first custom group
+    was (the end of the list when there was none). Other presets keep their comments and formatting."""
+    y = _rt()
+    doc = y.load(path.read_text())
+    seq = doc.get("command_groups")
+    if not isinstance(seq, CommentedSeq):
+        return {"ok": False, "errors": ["config.yaml has no command_groups list"]}
+    plain = yaml.safe_load(path.read_text()) or {}
+    old_nodes = {g.get("id"): g for g in seq if is_custom_group(g)}
+    idx = [i for i, g in enumerate(seq) if is_custom_group(g)]
+    first = idx[0] if idx else len(seq)
+    expected_customs = []
+    new_nodes = []
+    for g in groups:
+        if g.get("keep"):
+            node = old_nodes.get(g["id"])
+            if node is None:
+                return {"ok": False, "errors": [f"Custom command {g['id']} is no longer in config.yaml - reload the page"]}
+            new_nodes.append(node)
+            expected_customs.append(next(x for x in plain["command_groups"] if x.get("id") == g["id"]))
+            continue
+        node = old_nodes.get(g["id"])
+        fresh = CommentedMap()
+        for k, v in g.items():
+            fresh[k] = _literal(v)
+        if node is not None:            # keep comments on the existing entry where the structure allows it
+            node = _merge(node, {k: _literal(v) for k, v in g.items()})
+        else:
+            node = fresh
+        new_nodes.append(node)
+        expected_customs.append(g)
+    for i in reversed(idx):
+        del seq[i]
+    for k, node in enumerate(new_nodes):
+        seq.insert(first + k, node)
+    # Rewrite only the command_groups block; every other line of the file stays byte-for-byte the same
+    # (a full ruamel dump would reformat flow mappings and long lists elsewhere).
+    src = path.read_text()
+    m = re.search(r"^command_groups:.*?(?=^[^\s#]|\Z)", src, re.M | re.S)
+    if not m:
+        return {"ok": False, "errors": ["Could not find the command_groups section in config.yaml"]}
+    part = CommentedMap()
+    part["command_groups"] = seq
+    buf = io.StringIO()
+    y.dump(part, buf)
+    text = src[:m.start()] + buf.getvalue() + src[m.end():]
+    try:
+        reread = yaml.safe_load(text) or {}
+    except yaml.YAMLError as e:
+        return {"ok": False, "errors": [f"Internal error: the updated config would not be valid YAML ({e}). Nothing was written."]}
+    others = [x for x in plain["command_groups"] if not is_custom_group(x)]
+    want = {**plain, "command_groups": others[:first - sum(1 for i in idx if i < first)] + expected_customs
+            + others[first - sum(1 for i in idx if i < first):]}
+    if reread != want:
+        return {"ok": False, "errors": ["Internal error: the updated config did not round-trip. Nothing was written."]}
+    errors = validate(reread)
+    if errors:
+        return {"ok": False, "errors": errors}
     backup = _backup(path)
     path.write_text(text)
     return {"ok": True, "backup": backup}

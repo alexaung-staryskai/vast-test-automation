@@ -427,6 +427,18 @@ tr.step-queued td { opacity: .6; }
 .switch .lim-state .ok { color: var(--ok); }
 
 .presets-hint { padding: 12px 16px; border-style: dashed; }
+/* Presets: one dropdown per menu (Client Cmds, Connection, File System, ...) */
+.pmenu { position: relative; }
+.pmenu-btn .chev { font-size: 11px; margin-left: 2px; }
+.pmenu-list { position: absolute; top: calc(100% + 4px); left: 0; z-index: 30; min-width: 220px; padding: 4px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.25); }
+.pmenu-item { display: block; width: 100%; text-align: left; padding: 7px 10px; border: 0; border-radius: 6px;
+  background: transparent; color: var(--text); font: inherit; cursor: pointer; white-space: nowrap; }
+.pmenu-item::before { content: "▶"; font-size: 10px; margin-right: 8px; opacity: .6; }
+.pmenu-item:hover, .pmenu-item:focus-visible { background: var(--accent); color: var(--accent-text); outline: none; }
+.pmenu-item.danger { color: var(--bad); }
+.pmenu-item.danger:hover, .pmenu-item.danger:focus-visible { background: var(--bad); color: #fff; }
+.pmenu-empty { padding: 8px 10px; font-size: 12px; color: var(--muted); white-space: normal; max-width: 280px; }
 
 /* collapsible cards (Required packages, Presets): folded = title bar only */
 .collapse-toggle { background: none; border: 0; padding: 0; margin: 0; font: inherit; color: inherit; cursor: pointer;
@@ -573,3 +585,14 @@ tr.step-queued td { opacity: .6; }
 .cs-only { visibility: hidden; padding: 1px 6px; }
 .cs-row:hover .cs-only, .cs-only:focus-visible { visibility: visible; }
 .cs-none { padding: 14px 10px; }
+
+/* Custom Linux commands (Configuration tab) */
+.cc-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+.cc-item { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; background: var(--bg); }
+.cc-item.locked { opacity: .85; }
+.cc-head { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+.cc-name { flex: 1 1 260px; max-width: 420px; }
+.cc-acts { margin-left: auto; }
+.cc-opts { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+.cc-confirm { flex: 1 1 260px; max-width: 520px; }
+.cc-pre { margin: 0; font-size: 12px; white-space: pre-wrap; color: var(--muted); }

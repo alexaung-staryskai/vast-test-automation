@@ -306,7 +306,7 @@ mount:
   read_ahead_command: 'DEV=$(mountpoint -d ${mount.mount_point}) && echo ${mount.read_ahead_kb} > /sys/class/bdi/$DEV/read_ahead_kb && echo "read_ahead_kb for $DEV = $(cat /sys/class/bdi/$DEV/read_ahead_kb)"'
 
 # ---------------------------------------------------------------------
-# elbencho benchmark (Tab 2 -> Elbencho Write / Elbencho Read / Elbencho Auto Read/Write)
+# elbencho benchmark (Tab 2 -> Elbencho Write / Elbencho Read / Elbencho Auto Write/Read)
 # Commands use these as ${elbencho.…}, like ${mount.…}. Data written per client by Write =
 #   threads x dirs x files x file_size   (defaults: 32 x 1 x 8 x 4g = 1 TiB per client)
 # ---------------------------------------------------------------------
@@ -320,7 +320,7 @@ elbencho:
   flags: "--direct"        # extra flags for sequential write/read ("" = buffered I/O)
   options: "-t ${elbencho.threads} -n ${elbencho.dirs} -N ${elbencho.files} -s ${elbencho.file_size} -b ${elbencho.block_size} ${elbencho.flags}"
   # never write anywhere but the mounted VAST view (an unmounted mount point is just a local directory)
-  check_mount: 'mountpoint -q "${mount.mount_point}" || { echo "${mount.mount_point} is not mounted - run Mount NFSv3 first"; exit 1; }'
+  check_mount: 'mountpoint -q "${mount.mount_point}" || { echo "${mount.mount_point} is not mounted - run Mount NFS first"; exit 1; }'
   mkdir_command: 'mkdir -p "${elbencho.dir}"'
   write_command: 'elbencho --nolive -w -d ${elbencho.options} "${elbencho.dir}"'
   read_command: 'elbencho --nolive -r ${elbencho.options} "${elbencho.dir}"'
@@ -433,17 +433,22 @@ execution:
   input_prompt_regex: '(\?\s*$|:\s*$|\[[yYnN]/[yYnN]\]|\([yYnN]/[yYnN]\)|password|passphrase|press (any key|enter)|continue)'
   input_idle_seconds: 3
 
-# Preset command groups - each becomes a button in Tab 2.
+# Preset command groups - each becomes an item in a Presets dropdown in Tab 2.
+#   menu: <name>   -> the dropdown it sits in: Client Cmds, Connection, File System, Performance Test,
+#                     Utilities (a new name adds a dropdown). Without menu: it goes under Customs.
+#   Your own commands: ⚙ Configuration → Custom Linux commands (saved here with menu: Customs).
 #   results: true  -> output is parsed for elbencho results and exported to JSON + TXT
 command_groups:
   - id: precheck
-    label: Pre-check
+    label: Pre-checks
+    menu: Client Cmds
     commands:
       - uname -r
       - cat /etc/os-release | head -2
 
   - id: client_info
-    label: Client Info
+    label: Client info
+    menu: Client Cmds
     sudo: false
     commands:                 # read-only: OS, kernel, VAST NFS driver, CPU, RAM, network speed and IPs
       - display: show OS, kernel, VAST NFS driver, CPU, RAM, network speed and IP addresses
@@ -501,14 +506,16 @@ command_groups:
           fi
 
   - id: ping_vip
-    label: Ping VIP
+    label: Ping VMS with VIP
+    menu: Connection
     sudo: false
     commands:
       # 5 pings to the first IP of this site's tenant VIP pool, then stop
       - ping -c 5 ${tenant_vip.start}
 
   - id: mount
-    label: Mount NFSv3
+    label: Mount NFS
+    menu: File System
     commands:
       # a stale or previous mount here (e.g. of a view that was deleted) blocks everything with "Stale file handle":
       # unmount it first (forced, or lazy if the server side is gone)
@@ -519,12 +526,13 @@ command_groups:
 
   - id: mount_status
     label: Mount Status
+    menu: File System
     sudo: false
     commands:                 # read-only: what is mounted at the mount point, is it this site's view, does it respond
       - display: check the mount at ${mount.mount_point}
         run: |
           M="${mount.mount_point}"
-          if ! grep -qs " $M " /proc/mounts; then echo "RESULT: NOT MOUNTED - nothing is mounted at $M (run Mount NFSv3)"; exit 1; fi
+          if ! grep -qs " $M " /proc/mounts; then echo "RESULT: NOT MOUNTED - nothing is mounted at $M (run Mount NFS)"; exit 1; fi
           SRC=$(grep " $M " /proc/mounts | awk '{print $1}' | tail -1)
           grep " $M " /proc/mounts | tail -1 | awk '{print "source:   "$1; print "type:     "$3; print "options:  "$4}'
           case "$SRC" in
@@ -535,16 +543,18 @@ command_groups:
             df -h "$M" | tail -1 | awk '{print "usage:    "$3" used of "$2" ("$5"), "$4" free"}'
             echo "RESULT: mounted and responding"
           else
-            echo "RESULT: mounted but NOT responding (stale file handle or VIP unreachable) - run Mount NFSv3 to remount"; exit 1
+            echo "RESULT: mounted but NOT responding (stale file handle or VIP unreachable) - run Mount NFS to remount"; exit 1
           fi
 
   - id: readahead
-    label: Set read-ahead
+    label: Set Read-ahead
+    menu: File System
     commands:
       - ${mount.read_ahead_command}
 
   - id: elbencho_write
     label: Elbencho Write
+    menu: Performance Test
     results: true
     commands:
       - ${elbencho.check_mount}
@@ -553,13 +563,15 @@ command_groups:
 
   - id: elbencho_read
     label: Elbencho Read
+    menu: Performance Test
     results: true
     commands:                 # reads the files that Elbencho Write left behind
       - ${elbencho.check_mount}
       - ${elbencho.read_command}
 
   - id: elbencho                # (kept this id so older results stay linked)
-    label: Elbencho Auto Read/Write
+    label: Elbencho Auto Write/Read
+    menu: Performance Test
     results: true
     delay_between_commands_seconds: 5
     commands:                 # write, read back, delete
@@ -571,6 +583,7 @@ command_groups:
 
   - id: elbencho_delete
     label: Delete Elbencho Files
+    menu: Utilities
     results: false
     confirm: Deletes all elbencho files of the ticked clients on the VAST view (each client's folder under <mount point>/elbencho/). This cannot be undone.
     commands:
@@ -579,10 +592,12 @@ command_groups:
 
   - id: drop_caches
     label: Clear Linux Cache
+    menu: Utilities
     commands:
       - ${elbencho.drop_caches_command}
 
   - id: unmount
     label: Unmount
+    menu: File System
     commands:
       - 'umount "${mount.mount_point}" 2>/dev/null || umount -f "${mount.mount_point}" 2>/dev/null || umount -l "${mount.mount_point}"'   # normal, then forced, then lazy (stale mounts)

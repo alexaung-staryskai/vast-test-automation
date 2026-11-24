@@ -352,6 +352,24 @@
     <section class="card" id="cfgYamlCard" hidden>
       <textarea id="cfgYaml" class="yaml" spellcheck="false"></textarea>
     </section>
+    <section class="card collapsible" id="ccCard">
+      <div class="card-head">
+        <h2><button type="button" class="collapse-toggle" aria-expanded="true" aria-controls="ccCard" title="Hide / show this section"><span class="chev" aria-hidden="true">▾</span> Custom Linux commands</button></h2>
+        <div class="btn-row">
+          <span id="ccDirty" class="dirty" hidden>● unsaved changes</span>
+          <button class="btn" id="ccAdd">+ New command</button>
+          <button class="btn" id="ccImport" title="Load commands from a file exported here (or from another site). They are added as unsaved changes for you to review.">⤒ Import</button>
+          <button class="btn" id="ccExport" title="Download these commands (including unsaved edits) as a YAML file">⤓ Export</button>
+          <input type="file" id="ccFile" accept=".yaml,.yml,.json,text/yaml,application/json" hidden>
+          <button class="btn ghost" id="ccRevert">Revert</button>
+          <button class="btn primary" id="ccSave">💾 Save commands</button>
+        </div>
+      </div>
+      <div class="muted small">Each command is added to <b>Presets → Customs</b> in tab ② and runs on the consoles that are ticked ✓.
+        Template values work as in the built-in presets, e.g. <code>${mount.mount_point}</code>, <code>${tenant_vip.start}</code>, <code>${client.name}</code>.</div>
+      <div id="ccMsg" class="small"></div>
+      <div id="ccList" class="cc-list"></div>
+    </section>
   </main>
 
   <script src="/static/vendor/xterm.min.js"></script>

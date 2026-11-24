@@ -111,6 +111,7 @@ function showTab(id) {
   $$(".tabpanel").forEach((p) => p.classList.toggle("active", p.id === id));
   if (id === "t2") consoles.forEach((c) => c.fit());
   if (id === "t3" && !cfgEdit.loaded) loadRawConfig();
+  if (id === "t3" && !cc.loaded) loadCustomCmds();
   if (id === "t0") renderSites();
   if (id === "t5") { loadResults(); requestAnimationFrame(fitLogsSplit); }
   if (id === "t6" && typeof openChartTab === "function") openChartTab();
@@ -1072,6 +1073,69 @@ function elbenchoInfo(e) {
   return `<b>Benchmark</b><span><span class="mono">${esc(e.threads)} threads × ${esc(e.dirs)} dir × ${esc(e.files)} files × ${esc(e.file_size)}</span>
       · block ${esc(e.block_size)} ${esc(e.flags || "")}${Number.isFinite(per) ? ` · <b>${fmtBytes(per)} per client</b>${clients > 1 ? ` (${fmtBytes(per * clients)} for ${clients} ticked consoles)` : ""}` : ""}</span>`;
 }
+// Presets are grouped into dropdown menus by each group's `menu:` key. Built-in presets fall back to
+// their usual menu by id (older site configs have no `menu:`); anything else goes under Customs.
+const PRESET_MENUS = ["Client Cmds", "Connection", "File System", "Performance Test", "Utilities"];
+const DEFAULT_MENU = { precheck: "Client Cmds", client_info: "Client Cmds", ping_vip: "Connection",
+  mount: "File System", mount_status: "File System", readahead: "File System", unmount: "File System",
+  elbencho_write: "Performance Test", elbencho_read: "Performance Test", elbencho: "Performance Test",
+  elbencho_delete: "Utilities", drop_caches: "Utilities" };
+function presetMenus(groups) {
+  const menus = new Map(PRESET_MENUS.map((m) => [m, []]));
+  for (const g of groups) {
+    const m = g.menu || DEFAULT_MENU[g.id] || "Customs";
+    if (!menus.has(m)) menus.set(m, []);          // a new menu name in the config gets its own dropdown
+    menus.get(m).push(g);
+  }
+  const customs = menus.get("Customs") || [];      // Customs always comes last, even when empty
+  menus.delete("Customs"); menus.set("Customs", customs);
+  return [...menus].filter(([m, gs]) => gs.length || m === "Customs").map(([m, gs], i) => `
+    <div class="pmenu">
+      <button type="button" class="btn pmenu-btn${gs.some((g) => g.results) ? " primary" : ""}" aria-haspopup="menu" aria-expanded="false"
+        aria-controls="pmenu-${i}">${esc(m)} <span class="chev" aria-hidden="true">▾</span></button>
+      <div class="pmenu-list" id="pmenu-${i}" role="menu" hidden>${gs.length
+        ? gs.map((g) => {
+            const danger = g.confirm && DEFAULT_MENU[g.id];      // red only for the built-in destructive ones (Delete)
+            return `<button type="button" role="menuitem" class="pmenu-item${danger ? " danger" : ""}" data-group="${esc(g.id)}"${g.confirm ? ' title="Asks before running"' : ""}>${esc(g.label)}${g.confirm && !danger ? "…" : ""}</button>`;
+          }).join("")
+        : `<div class="pmenu-empty">No custom commands yet.<br><a href="#" data-goto-cc>Add one in ⚙ Configuration → Custom Linux commands</a></div>`}</div>
+    </div>`).join("");
+}
+function closePresetMenus(except) {
+  $$("#presets .pmenu").forEach((m) => {
+    if (m === except) return;
+    $(".pmenu-list", m).hidden = true;
+    $(".pmenu-btn", m).setAttribute("aria-expanded", "false");
+  });
+}
+$("#presets").addEventListener("click", (e) => {
+  const b = e.target.closest(".pmenu-btn");
+  if (b) {
+    const m = b.parentElement, l = $(".pmenu-list", m);
+    closePresetMenus(m);
+    l.hidden = !l.hidden;
+    b.setAttribute("aria-expanded", String(!l.hidden));
+    if (!l.hidden) $(".pmenu-item", l)?.focus();
+    return;
+  }
+  if (e.target.closest(".pmenu-item")) closePresetMenus();
+  if (e.target.closest("[data-goto-cc]")) {
+    e.preventDefault(); closePresetMenus(); showTab("t3");
+    setCollapsed($("#ccCard"), false);
+    setTimeout(() => $("#ccCard").scrollIntoView({ block: "start" }), 50);
+  }
+});
+document.addEventListener("click", (e) => { if (!e.target.closest("#presets .pmenu")) closePresetMenus(); });
+document.addEventListener("keydown", (e) => {
+  const open = $("#presets .pmenu-list:not([hidden])");
+  if (e.key === "Escape" && open) { closePresetMenus(); $(".pmenu-btn", open.parentElement).focus(); return; }
+  const item = e.target.closest?.(".pmenu-item");
+  if (item && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+    e.preventDefault();
+    const its = $$(".pmenu-item", item.parentElement), i = its.indexOf(item);
+    its[(i + (e.key === "ArrowDown" ? 1 : its.length - 1)) % its.length].focus();
+  }
+});
 function renderPresets() {
   const m = CFG.mount || {};
   $("#mountInfo").innerHTML = `<b>Mount point</b><span class="mono">${esc(m.mount_point)}</span>
@@ -1079,7 +1143,7 @@ function renderPresets() {
     <b>Options</b><span class="mono">${esc(m.options)}</span><b>Read-ahead</b><span>${esc(m.read_ahead_kb)} KB</span>` +
     elbenchoInfo(CFG.elbencho || {});
   const groupBtn = (g) => `<button class="btn ${g.results ? "primary" : ""}" data-group="${esc(g.id)}">${g.section === "packages" ? "" : "▶ "}${esc(g.label)}</button>`;
-  $("#presets").innerHTML = CFG.groups.filter((g) => g.section !== "packages").map(groupBtn).join("");
+  $("#presets").innerHTML = presetMenus(CFG.groups.filter((g) => g.section !== "packages"));
   $("#pkgGroups").innerHTML = CFG.groups.filter((g) => g.section === "packages").map(groupBtn).join("");
   $("#cmdList").innerHTML = CFG.groups
     .map((g) => `<div><b>${esc(g.label)}</b> <span class="muted small">· delay ${g.delay}s${g.results ? " · results exported" : ""}</span>
@@ -1104,7 +1168,7 @@ $("#presets").addEventListener("rungroup", async (e) => {
   try { await startRun("/api/runs", { group: g.id, session_ids: selectedIds() }, g.label); } catch (err) { alert(err.message); }
 });
 $("#presets").addEventListener("click", async (e) => {
-  const gid = e.target.dataset.group;
+  const gid = e.target.closest(".pmenu-item")?.dataset.group;
   if (!gid) return;
   const g = CFG.groups.find((x) => x.id === gid);
   if (!(await confirmGroup(g))) return;
@@ -1787,11 +1851,161 @@ $("#cfgSave").onclick = (e) => busy(e.target, async () => {
     await loadConfig();
     cfgMsg(`✓ Saved and reloaded.${r.backup ? ` Previous version backed up to <code>${esc(r.backup)}</code>` : ""}` +
       envNotes(r.warnings), "okmsg");
+    if (!cc.dirty) loadCustomCmds();
   } catch (err) {
     cfgMsg("Not saved: " + (err.errors || [err.message]).map(esc).join("<br>"), "err");
   }
 });
 window.addEventListener("beforeunload", (e) => { if (cfgEdit.dirty) { e.preventDefault(); e.returnValue = ""; } });
+
+/* ---- Custom Linux commands: their own small editor; saving rewrites only the custom presets ---- */
+const cc = { loaded: false, list: [], mtime: null, dirty: false };
+function ccSetDirty(v) { cc.dirty = v; $("#ccDirty").hidden = !v; }
+function ccMsg(html, cls = "") { $("#ccMsg").innerHTML = html ? `<span class="${cls}">${html}</span>` : ""; }
+async function loadCustomCmds() {
+  const r = await api("GET", "/api/custom-commands");
+  cc.loaded = true; cc.mtime = r.mtime; cc.list = r.commands;
+  ccSetDirty(false); renderCustomCmds();
+}
+function renderCustomCmds() {
+  const root = $("#ccList");
+  if (!cc.list.length) {
+    root.innerHTML = `<div class="empty small">No custom commands yet. Click <b>+ New command</b>, enter a name and the Linux commands, then <b>💾 Save commands</b>.</div>`;
+    return;
+  }
+  root.innerHTML = cc.list.map((c, i) => c.editable === false ? `
+    <div class="cc-item locked" data-i="${i}">
+      <div class="cc-head"><b>${esc(c.label)}</b><span class="muted small">${esc(c.id)} · written by hand in config.yaml${c.extra ? ` (uses ${c.extra.map(esc).join(", ")})` : ""} - edit it in the YAML view below</span>
+        <span class="btn-row cc-acts">${ccMoveBtns(i)}</span></div>
+      <pre class="cc-pre">${esc(c.text)}</pre>
+    </div>` : `
+    <div class="cc-item" data-i="${i}">
+      <div class="cc-head">
+        <label class="f-field cc-name">Name in the Customs menu<input type="text" data-k="label" value="${esc(c.label)}" placeholder="e.g. Disk usage" maxlength="60"></label>
+        <div class="seg cc-mode" role="group" aria-label="How the commands run">
+          <button type="button" class="seg-btn ${c.mode !== "script" ? "active" : ""}" data-mode="lines" title="Every line is a separate command, run one after another (stops at the first failure)">One command per line</button>
+          <button type="button" class="seg-btn ${c.mode === "script" ? "active" : ""}" data-mode="script" title="The whole text runs as one bash script (use for if/for/variables)">One script</button>
+        </div>
+        <span class="btn-row cc-acts">${ccMoveBtns(i)}<button type="button" class="btn sm ghost danger" data-act="del" title="Remove">✕</button></span>
+      </div>
+      <label class="f-field wide">${c.mode === "script" ? "Script (runs as one bash script)" : "Linux commands (one per line, run in order)"}
+        <textarea data-k="text" rows="${Math.min(12, Math.max(3, (c.text || "").split("\n").length + 1))}" spellcheck="false" placeholder="df -h ${"${mount.mount_point}"}&#10;lsblk">${esc(c.text)}</textarea></label>
+      <div class="cc-opts">
+        <label class="f-field check"><input type="checkbox" data-k="sudo" ${c.sudo ? "checked" : ""}> Run with sudo</label>
+        <label class="f-field check"><input type="checkbox" data-k="ask" ${c.confirm ? "checked" : ""}> Ask before running</label>
+        <label class="f-field cc-confirm" ${c.confirm ? "" : "hidden"}><input type="text" data-k="confirm" value="${esc(c.confirm)}" placeholder="Message shown before it runs"></label>
+        <label class="f-field check" title="Parse elbencho output and save it as a performance result (Results card, Chart)"><input type="checkbox" data-k="results" ${c.results ? "checked" : ""}> Save elbencho results</label>
+      </div>
+    </div>`).join("");
+}
+const ccMoveBtns = (i) => `<button type="button" class="btn sm ghost" data-act="up" title="Move up" ${i ? "" : "disabled"}>↑</button>` +
+  `<button type="button" class="btn sm ghost" data-act="down" title="Move down" ${i < cc.list.length - 1 ? "" : "disabled"}>↓</button>`;
+$("#ccList").addEventListener("input", (e) => {
+  const item = e.target.closest(".cc-item"), k = e.target.dataset.k;
+  if (!item || !k) return;
+  const c = cc.list[+item.dataset.i];
+  if (k === "ask") {
+    const box = $(".cc-confirm", item); box.hidden = !e.target.checked;
+    c.confirm = e.target.checked ? ($("input", box).value || `Runs "${c.label || "this command"}" on the ticked consoles.`) : "";
+    $("input", box).value = c.confirm;
+  } else c[k] = e.target.type === "checkbox" ? e.target.checked : e.target.value;
+  ccSetDirty(true);
+});
+$("#ccList").addEventListener("click", async (e) => {
+  const item = e.target.closest(".cc-item");
+  if (!item) return;
+  const i = +item.dataset.i;
+  const mode = e.target.closest(".cc-mode .seg-btn")?.dataset.mode;
+  if (mode) { if (cc.list[i].mode !== mode) { cc.list[i].mode = mode; ccSetDirty(true); renderCustomCmds(); } return; }
+  const act = e.target.closest("[data-act]")?.dataset.act;
+  if (!act) return;
+  if (act === "del") {
+    if (!(await uiConfirm({ title: `Remove ${cc.list[i].label || "this command"}?`, ok: "Remove", danger: true, html: "Takes effect when you click 💾 Save commands." }))) return;
+    cc.list.splice(i, 1);
+  } else if (act === "up" && i > 0) [cc.list[i - 1], cc.list[i]] = [cc.list[i], cc.list[i - 1]];
+  else if (act === "down" && i < cc.list.length - 1) [cc.list[i + 1], cc.list[i]] = [cc.list[i], cc.list[i + 1]];
+  else return;
+  ccSetDirty(true); renderCustomCmds();
+});
+$("#ccAdd").onclick = () => {
+  setCollapsed($("#ccCard"), false);
+  cc.list.push({ id: null, label: "", mode: "lines", text: "", sudo: false, confirm: "", results: false, editable: true });
+  ccSetDirty(true); renderCustomCmds();
+  const items = $$("#ccList .cc-item"); items[items.length - 1].scrollIntoView({ block: "nearest" });
+  $("input[data-k=label]", items[items.length - 1]).focus();
+};
+$("#ccRevert").onclick = (e) => busy(e.target, async () => { await loadCustomCmds(); ccMsg("Reverted to the saved commands.", "muted"); });
+$("#ccSave").onclick = (e) => busy(e.target, async () => {
+  try {
+    const r = await api("PUT", "/api/custom-commands", { commands: ccPayload(), base_mtime: cc.mtime });
+    cc.mtime = r.mtime; cc.list = r.commands; ccSetDirty(false); renderCustomCmds();
+    await loadConfig();                                        // Presets → Customs picks them up at once
+    if (!cfgEdit.dirty) await loadRawConfig();                 // keep the full editor in step with the file
+    else cfgMsg("config.yaml changed (custom commands saved). Your unsaved edits above would overwrite it - click Revert first.", "err");
+    ccMsg(`✓ Saved ${r.commands.length} custom command${r.commands.length === 1 ? "" : "s"} - they are in Presets → Customs (tab ②).` +
+      (r.backup ? ` Previous config backed up to <code>${esc(r.backup)}</code>` : ""), "okmsg");
+  } catch (err) {
+    ccMsg("Not saved: " + (err.errors || [err.message]).map(esc).join("<br>"), "err");
+  }
+});
+window.addEventListener("beforeunload", (e) => { if (cc.dirty) { e.preventDefault(); e.returnValue = ""; } });
+
+// Export: the editor's current list (unsaved edits included) as a YAML file. Import: a file exported here or on
+// another site; the commands are added as unsaved changes, so they are reviewed before 💾 Save commands.
+const ccPayload = () => cc.list.map((c) => c.editable === false ? { id: c.id, keep: true }
+  : { id: c.id, label: c.label, mode: c.mode === "script" ? "script" : "lines", text: c.text || "", sudo: !!c.sudo, confirm: c.confirm || "", results: !!c.results });
+$("#ccExport").onclick = (e) => busy(e.target, async () => {
+  if (!cc.list.some((c) => c.editable !== false)) { ccMsg("Nothing to export yet - add a command first.", "muted"); return; }
+  const r = await api("POST", "/api/custom-commands/export", { commands: ccPayload() });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([r.text], { type: "text/yaml" }));
+  a.download = r.filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  ccMsg(`⤓ Exported ${r.count} command${r.count === 1 ? "" : "s"} to <code>${esc(r.filename)}</code>` +
+    (r.skipped ? ` · ${r.skipped} written by hand in config.yaml not included` : "") +
+    (cc.dirty ? " · includes your unsaved edits" : ""), "okmsg");
+});
+$("#ccImport").onclick = () => { $("#ccFile").value = ""; $("#ccFile").click(); };
+$("#ccFile").onchange = async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  try {
+    if (f.size > 1_000_000) throw new Error("The file is too large (over 1 MB) for a list of commands.");
+    const r = await api("POST", "/api/custom-commands/import", { text: await f.text() });
+    if (!r.commands.length) { ccMsg(`Nothing imported from <code>${esc(f.name)}</code>: ${r.skipped.map(esc).join("; ")}`, "err"); return; }
+    if (!cc.loaded) await loadCustomCmds();
+    const byName = new Map(cc.list.map((c, i) => [String(c.label).trim().toLowerCase(), i]));
+    const clash = r.commands.filter((c) => byName.has(c.label.toLowerCase()));
+    let replace = false;
+    if (clash.length) {
+      replace = await uiConfirm({ title: `${clash.length} command${clash.length === 1 ? " has" : "s have"} the same name`, ok: "Replace existing", cancel: "Keep both",
+        html: `<p>${clash.map((c) => `<b>${esc(c.label)}</b>`).join(", ")} already exist${clash.length === 1 ? "s" : ""} here.</p>
+               <p class="muted">Replace overwrites them with the imported version. Keep both adds the imported one as “name (2)”.</p>` });
+    }
+    let added = 0, replaced = 0;
+    for (const c of r.commands) {
+      const key = c.label.toLowerCase();
+      if (byName.has(key) && replace && cc.list[byName.get(key)].editable !== false) {
+        const old = cc.list[byName.get(key)];
+        cc.list[byName.get(key)] = { ...c, id: old.id };        // keep the id: logs and results stay linked
+        replaced++;
+        continue;
+      }
+      let label = c.label, k = 2;
+      while ([...cc.list].some((x) => String(x.label).trim().toLowerCase() === label.toLowerCase())) label = `${c.label} (${k++})`.slice(0, 60);
+      cc.list.push({ ...c, label });
+      added++;
+    }
+    setCollapsed($("#ccCard"), false);
+    ccSetDirty(true); renderCustomCmds();
+    ccMsg(`⤒ Imported from <code>${esc(f.name)}</code>: ${added} added${replaced ? `, ${replaced} replaced` : ""}` +
+      (r.skipped.length ? ` · skipped: ${r.skipped.map(esc).join("; ")}` : "") +
+      ` - review them, then click <b>💾 Save commands</b>.`, "okmsg");
+  } catch (err) {
+    ccMsg("Not imported: " + (err.errors || [err.message]).map(esc).join("<br>"), "err");
+  }
+};
 
 /* ================= TEST SITES ================= */
 let siteData = null;
@@ -1912,6 +2126,8 @@ function resetUi() {
   $("#secrets").innerHTML = ""; $("#cleanupOut").innerHTML = ""; $("#vipSettingsMsg").innerHTML = "";
   $("#pkgTable").innerHTML = "Runs on the consoles that are ticked ✓.";
   cfgEdit.loaded = false;
+  // the custom commands belong to the site: reload them for the newly opened one
+  cc.loaded = false; cc.list = []; cc.mtime = null; ccSetDirty(false); ccMsg(""); renderCustomCmds();
 }
 $("#siteBtn").onclick = showSites;
 $("#siteCreate").onsubmit = (e) => {
