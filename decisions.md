@@ -240,4 +240,4 @@ Last updated: 2026-11-24.
 
 - Test `run.bat` / `stop.bat` on a real Windows machine.
 - Optional: show the running step and its elapsed time in the preset run status line, so silent elbencho phases are visibly working.
-- Local changes since the first GitHub push (VIP selection, Perf Test removal, onboarding layout, Create Tenant, stale-mount handling, single run-status line, 📈 Chart, Mount Status, no root squash, multipath mount default, Client Info, this file) are **not pushed yet**.
+- All changes up to 2026-11-24 are pushed to GitHub.
