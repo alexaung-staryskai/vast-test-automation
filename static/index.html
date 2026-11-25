@@ -45,7 +45,8 @@
     <section class="card">
       <div class="card-head">
         <div><h2>Test sites</h2><span class="muted small" id="sitesDir"></span></div>
-        <button class="btn primary" id="siteNewBtn">＋ New Test Site</button>
+        <div class="btn-row"><button class="btn" id="siteLogBtn" title="Every test-site deletion: what was deleted on the VMS, failures and force deletes">🗒 Delete log</button>
+        <button class="btn primary" id="siteNewBtn">＋ New Test Site</button></div>
       </div>
       <p class="muted small">A test site is a folder that holds everything for one test: configuration, onboarded tenants and results.
         Copy or zip the folder to let someone else open it and replicate the steps.</p>
@@ -61,6 +62,7 @@
         </form>
         <div id="siteCreateMsg" class="small"></div>
       </div>
+      <div id="siteTabs" class="subtabs" role="tablist" aria-label="Test sites"></div>
       <div id="siteList" class="sitetable-wrap"></div>
       <div id="siteListMsg" class="small"></div>
       <h3>Open from a folder</h3>

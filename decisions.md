@@ -275,3 +275,25 @@ Last updated: 2026-11-24.
 - Test `run.bat` / `stop.bat` on a real Windows machine.
 - Optional: show the running step and its elapsed time in the preset run status line, so silent elbencho phases are visibly working.
 - All changes up to 2026-11-24 are pushed to GitHub.
+
+## Delete site removes the tenant from the VMS too (modal, 4 steps)
+
+- The user types the site name and the tenant name (as on the VMS). With a tenant on record the typed name must match it; with none, any name may be typed, and a tenant that is not in the site's records needs an extra "I'm sure" tick on the review step. The VMS default tenant (id 1 / `default`) is refused.
+- Scan (`POST /api/sites/teardown/scan`): the tenant is looked up by exact name, then every asset kind is listed. Most VMS list endpoints don't filter by tenant (or ignore the filter), so each object is kept only if its own field proves it is the tenant's: `tenant_id` (views, view policies, QoS, quotas, VIP pools), `tenant_id` + `user_type: TENANT_ADMIN` (managers), `tenants == [id]` (roles; shared roles are left and noted), the tenant's `local_provider` (S3 users - and only if no other tenant uses that provider; otherwise only the S3 user this site recorded).
+- Run (`POST /api/sites/teardown/run`, NDJSON stream): deletes only what the user reviewed that still exists, in the order view → view policy → S3 user → QoS policy → quota → VIP pool → tenant admin → admin role → tenant. Before each DELETE the object is read again and its ownership re-checked; after it, the app polls until GET returns 404 (tenant and VIP pool deletes are asynchronous). The first failure stops the run, marks the tenant `partial` in tenants.yaml and keeps the site; "Scan again and continue" picks up what is left. A failed delete of the tenant's `default` view policy is skipped (the VMS removes it with the tenant).
+- Only when the VMS side is clean is the folder moved to `sites/.trash/` (and the site closed if it was open).
+- The modal can't be closed while deleting. Animations respect `prefers-reduced-motion`.
+- `dev/mock_vms.py` now ignores `page`/`page_size` and handles `__icontains` filters.
+
+## Force delete of a tenant, and the delete log
+
+- The VMS can refuse `DELETE /tenants/{id}/` (seen: HTTP 503 "Failed to delete tenant's empty subdirectories. Please, consider using "force" to delete the tenant."). The 5.5 API has `force_remove=true` on that call: "Forces deletion of the tenant, even if files exist in the tenant directory".
+- When the tenant delete fails, the modal shows **⚠ Force delete tenant…**. The user must type `force delete <tenant name>`; the server checks the phrase again (400 otherwise). The run is repeated with that tenant forced; before the forced DELETE the tenant is scanned again and the force is refused if anything else (view, policy, user, …) is still under it - force only covers the tenant itself.
+- The app-wide log `sites/.delete-log.jsonl` (JSON lines; `sites/` is git-ignored) records: start, every object deleted/failed/skipped, stops, the typed force confirmation, the forced delete and its result, the final move to the trash, and "local records only" deletes with the tenants left on the VMS. It lives outside the site folders because those move to the trash. 🗒 Delete log on the 📁 Test site tab shows it newest first; force deletes are in bold red.
+
+## Delete site keeps the local records ("vms record deleted")
+
+- The test results are the point of a site, so 🗑 Delete site no longer moves the folder to `sites/.trash/`. It deletes the tenant's objects on the VMS, then sets `status: vms record deleted` (+ `vms_deleted_at`) in `site.yaml` and `status: vms record deleted` (+ `deleted_at`, `objects: []`) on the tenant in `tenants.yaml`. Configuration, tenants.yaml, saved credentials and results stay.
+- "vms record deleted" is treated like "deleted" (🧹 Cleanup) everywhere a tenant must be on the VMS: tenant counts, Verify/limits, the Tenants tab. The site list shows a "VMS record deleted" tag instead of Delete site; the tag disappears if a new tenant is onboarded in that site.
+- If the site is open, it stays open; the onboarding run state is reset because its objects no longer exist.
+- The "Delete local records only" fallback (when the VMS can't be reached) was removed. `DELETE /api/sites` (move to trash) still exists in the API but the UI no longer uses it; remove a site folder by hand if it is really no longer needed.

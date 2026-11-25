@@ -1,6 +1,8 @@
 /* VAST Test Bench - frontend (no build step) */
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+// tenant no longer on the VMS: "deleted" (🧹 Cleanup) or "vms record deleted" (🗑 Delete site, local records kept)
+const tGone = (t) => t.status === "deleted" || t.status === "vms record deleted";
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const pretty = (o) => esc(typeof o === "string" ? o : JSON.stringify(o, null, 2));
 const clone = (o) => JSON.parse(JSON.stringify(o));
@@ -29,14 +31,14 @@ async function busy(btn, fn) {
 
 /* In-page dialogs. Native confirm()/alert() are suppressed in some embedded browsers
    (confirm() returns false at once), which silently cancelled every guarded action. */
-function uiConfirm({ title, html = "", ok = "OK", cancel = "Cancel", danger = false }) {
+function uiConfirm({ title, html = "", ok = "OK", cancel = "Cancel", danger = false, wide = false }) {
   return new Promise((resolve) => {
     const wrap = document.createElement("div");
     wrap.className = "modal-backdrop";
-    wrap.innerHTML = `<div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    wrap.innerHTML = `<div class="modal${wide ? " modal-mid" : ""}" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
       <h3 id="modalTitle">${esc(title)}</h3><div class="modal-body">${html}</div>
       <div class="btn-row modal-actions">
-        <button class="btn ghost" data-r="0">${esc(cancel)}</button>
+        ${cancel ? `<button class="btn ghost" data-r="0">${esc(cancel)}</button>` : ""}
         <button class="btn ${danger ? "danger-solid" : "primary"}" data-r="1">${esc(ok)}</button></div></div>`;
     const done = (v) => { wrap.remove(); document.removeEventListener("keydown", onKey); resolve(v); };
     const onKey = (e) => { if (e.key === "Escape") done(false); };
@@ -47,7 +49,7 @@ function uiConfirm({ title, html = "", ok = "OK", cancel = "Cancel", danger = fa
     });
     document.addEventListener("keydown", onKey);
     document.body.appendChild(wrap);
-    wrap.querySelector('[data-r="0"]').focus();
+    wrap.querySelector('[data-r="0"], [data-r="1"]').focus();
   });
 }
 function toast(msg, kind = "err", ms = 7000) {
@@ -1486,7 +1488,7 @@ async function loadTenants() {
 }
 function renderTenants() {
   const all = tenantData.tenants;
-  const live = all.filter((t) => t.status !== "deleted");
+  const live = all.filter((t) => !tGone(t));
   $("#tenantCount").textContent = live.length ? live.length : "";
   const list = $("#showDeleted").checked ? all : live;
   $("#tenantsInfo").innerHTML = `${live.length} tenant${live.length === 1 ? "" : "s"} · ${all.length - live.length} deleted · stored in <code>${esc(tenantData.path)}</code>`;
@@ -1513,13 +1515,13 @@ function renderTenants() {
     const verified = t.verified_at
       ? `<span class="pill ${t.verify_ok ? "passed" : "failed"}">${t.verify_ok ? "verified" : "check failed"}</span> <span class="muted small">${fmtDate(t.verified_at)}</span>`
       : "";
-    return `<section class="card tenant ${t.status === "deleted" ? "deleted" : ""}" data-key="${esc(t.key)}">
+    return `<section class="card tenant ${tGone(t) ? "deleted" : ""}" data-key="${esc(t.key)}">
       <div class="card-head">
         <div><h2>${esc(t.name)} <span class="pill ${t.status === "active" ? "passed" : t.status === "partial" ? "reused" : "skipped"}">${esc(t.status)}</span></h2>
           <div class="muted small">${esc(t.vms)} · onboarded ${fmtDate(t.onboarded_at)}${t.deleted_at ? " · deleted " + fmtDate(t.deleted_at) : ""} ${verified}</div>
           ${t.note ? `<div class="small err">${esc(t.note)}</div>` : ""}</div>
         <div class="btn-row">
-          ${t.status !== "deleted" ? `<button class="btn" data-act="verify">✓ Verify on VMS</button>` : ""}
+          ${!tGone(t) ? `<button class="btn" data-act="verify">✓ Verify on VMS</button>` : ""}
           <button class="btn ghost danger" data-act="remove" title="Remove from tenants.yaml (does not touch the VMS)">Remove from list</button>
         </div>
       </div>
@@ -1536,7 +1538,7 @@ function renderTenants() {
           ${row("Name", t.view?.name)}${row("Path", t.view?.path, true, true)}${row("Protocols", (t.view?.protocols || []).join(" + "))}${row("Policy", t.view_policy?.name)}${row("Flavor", FLAVORS[t.view_policy?.flavor] || t.view_policy?.flavor)}</div></div>
         <div class="tbox"><h3>QoS &amp; quota</h3><div class="kv small">
           ${row("Read limit", t.qos?.read)}${row("Write limit", t.qos?.write)}${row("Hard limit", t.quota?.hard_limit)}${row("Soft limit", t.quota?.soft_limit && !/^0(\.0+)?\s/.test(t.quota.soft_limit) ? t.quota.soft_limit : "none")}</div>
-          ${t.status !== "deleted" ? `<div class="limit-switches" data-limits>
+          ${!tGone(t) ? `<div class="limit-switches" data-limits>
             <div class="small muted">Limits on the VMS (live)</div>
             ${["qos", "quota"].map((k) => `<label class="switch" data-kind="${k}">
               <input type="checkbox" data-limit="${k}" disabled><span class="slider" aria-hidden="true"></span>
@@ -2009,6 +2011,7 @@ $("#ccFile").onchange = async (e) => {
 
 /* ================= TEST SITES ================= */
 let siteData = null;
+let siteTab = store.get("siteTab") || "active";   // 📁 Test site list: "active" | "vmsdel"
 const fmtTime = (t) => (t ? new Date(t * 1000).toLocaleString() : "—");
 
 // The test-site tab. With no site open it is the only usable tab ("sitemode").
@@ -2074,13 +2077,22 @@ async function renderSites() {
       templates.map((s) => `<option value="${esc(s.path)}" data-desc="Copies the configuration only (not tenants or results).">“${esc(s.name)}”${cur && s.path === cur.path ? " (open now)" : ""}</option>`).join("") +
       `</optgroup>` : "");
   showTemplateDesc();
-  $("#siteList").innerHTML = siteData.sites.length
+  // two tabs: active sites / sites whose tenant was deleted from the VMS (🗑 Delete site keeps them for their results)
+  const isVmsDel = (s) => s.status === "vms record deleted";
+  const groups = { active: siteData.sites.filter((s) => !isVmsDel(s)), vmsdel: siteData.sites.filter(isVmsDel) };
+  if (!groups[siteTab]) siteTab = "active";
+  $("#siteTabs").innerHTML = [["active", "Active sites"], ["vmsdel", "VMS Record Deleted Sites"]].map(([k, label]) =>
+    `<button class="subtab ${siteTab === k ? "active" : ""}" role="tab" aria-selected="${siteTab === k}" data-sitetab="${k}">
+      ${label} <span class="subtab-n">${groups[k].length}</span></button>`).join("");
+  const shown = groups[siteTab];
+  $("#siteList").innerHTML = shown.length
     ? `<table class="sitetable"><thead><tr>
         <th>Test site</th><th>VMS</th><th class="num">Tenants</th><th class="num">Results</th><th>Last change</th><th>Folder</th><th></th>
-      </tr></thead><tbody>${siteData.sites.map((s) => {
+      </tr></thead><tbody>${shown.map((s) => {
         const isCur = cur && s.path === cur.path;
         return `<tr class="${isCur ? "current" : ""}" title="${esc(s.path)}">
           <td><b>${esc(s.name)}</b> ${isCur ? '<span class="pill passed">open</span>' : s.path === siteData.last ? '<span class="tag">last used</span>' : ""}
+            ${s.status === "vms record deleted" ? `<span class="pill vmsdel" title="Tenant and assets deleted from the VMS${s.vms_deleted_at ? " on " + esc(fmtDate(s.vms_deleted_at)) : ""}. Local records and test results are kept.">VMS record deleted</span>` : ""}
             ${s.description ? `<div class="small muted">${esc(s.description)}</div>` : ""}</td>
           <td class="mono small">${esc(s.vms || "—")}</td>
           <td class="num">${s.tenants}</td>
@@ -2089,10 +2101,14 @@ async function renderSites() {
           <td class="mono small folder" title="${esc(s.path)}">${esc(s.path.split("/").slice(-2).join("/"))}</td>
           <td class="acts">${isCur ? `<button class="btn sm" disabled>Opened</button>`
             : `<button class="btn sm ${s.path === siteData.last ? "primary" : ""}" data-open="${esc(s.path)}">Open site</button>`}
-            <button class="btn sm ghost danger" data-del="${esc(s.path)}" data-name="${esc(s.name)}">Delete site</button></td>
+            ${s.status === "vms record deleted" ? "" : `<button class="btn sm ghost danger" data-del="${esc(s.path)}" data-name="${esc(s.name)}"
+              title="Delete the tenant and its assets from the VMS. The site's local records and test results are kept.">Delete site</button>`}</td>
         </tr>`;
       }).join("")}</tbody></table>`
-    : `<div class="empty">No test sites yet - click <b>＋ New Test Site</b>.</div>`;
+    : siteTab === "vmsdel"
+      ? `<div class="empty">No sites here yet. When you use <b>Delete site</b>, the tenant is deleted from the VMS and the site moves here, with its test results kept.</div>`
+      : siteData.sites.length ? `<div class="empty">No active sites - all ${siteData.sites.length} are in <b>VMS Record Deleted Sites</b>. Click <b>＋ New Test Site</b> to start a new one.</div>`
+      : `<div class="empty">No test sites yet - click <b>＋ New Test Site</b>.</div>`;
   // with no sites at all, open the create form straight away
   if (!siteData.sites.length && !cur) showCreatePanel(true);
 }
@@ -2149,6 +2165,17 @@ function showCreatePanel(show) {
   if (show) setTimeout(() => $("#siteCreate [name=name]").focus(), 50);
 }
 $("#siteNewBtn").onclick = () => showCreatePanel(true);
+$("#siteLogBtn").onclick = () => showDeleteLog();
+const onSiteTab = (e) => {
+  const b = e.target.closest("[data-sitetab]");
+  if (!b || b.dataset.sitetab === siteTab) return;
+  siteTab = b.dataset.sitetab; store.set("siteTab", siteTab);
+  e.preventDefault();
+  $("#siteListMsg").innerHTML = "";
+  renderSites();
+};
+$("#siteTabs").addEventListener("click", onSiteTab);
+$("#siteListMsg").addEventListener("click", onSiteTab);
 $("#siteCreateCancel").onclick = () => { $("#siteCreate").reset(); showCreatePanel(false); };
 // Tenants that still exist on the VMS after their site's local records are deleted.
 function vmsReminder(tenants) {
@@ -2169,24 +2196,381 @@ $("#siteList").addEventListener("click", async (e) => {
   const b = e.target;
   if (b.dataset.open) return openSite({ path: b.dataset.open }, $("#siteListMsg"));
   if (b.dataset.del) {
-    const site = siteData.sites.find((s) => s.path === b.dataset.del) || { name: b.dataset.name, active_tenants: [] };
-    const isCur = siteData.current && siteData.current.path === b.dataset.del;
-    const left = vmsReminder(site.active_tenants || []);
-    const ok = await uiConfirm({
-      title: `Delete test site “${site.name}”?`, ok: "Delete local records", danger: true,
-      html: `<p>Deletes this site's <b>local records only</b>: configuration, <code>tenants.yaml</code>, saved credentials and results.
-        <b>Nothing is deleted on the VMS.</b> The folder is moved to <code>sites/.trash/</code>.</p>` +
-        (isCur ? `<p class="muted">This site is open now: it is closed and its consoles are disconnected.</p>` : "") + left,
-    });
-    if (!ok) return;
-    await busy(b, async () => {
-      const r = await api("DELETE", `/api/sites?path=${encodeURIComponent(b.dataset.del)}`);
-      if (isCur) { resetUi(); $("#siteName").textContent = "no site"; $("#cfgPath").textContent = "choose a test site"; }
-      await renderSites();
-      $("#siteListMsg").innerHTML = `<div class="okmsg">✓ Local records of “${esc(site.name)}” deleted (moved to <code>${esc(r.moved_to)}</code>).</div>` + left;
-    });
+    const site = siteData.sites.find((s) => s.path === b.dataset.del) || { name: b.dataset.name, path: b.dataset.del, active_tenants: [] };
+    deleteSiteModal(site);
   }
 });
+
+/* ---- 🗑 Delete site: a 4-step modal. ① type the site + tenant names → ② scan the tenant on the VMS and review
+   everything under it → ③ delete in order, animated → ④ done (folder moved to sites/.trash/). ---- */
+const DS_ORDER = [["view", "View"], ["view_policy", "View policy"], ["s3_user", "S3 user"], ["qos", "QoS policy"],
+  ["quota", "Quota"], ["vippool", "VIP pool"], ["tenant_admin", "Tenant admin"], ["admin_role", "Admin role"], ["tenant", "Tenant"]];
+const dsLow = (l) => l.replace(/^(View|Quota|Tenant|Admin)\b/, (m) => m.toLowerCase());          // "View policy" → "view policy", "S3 user" stays
+const dsPlural = (l) => (l.endsWith("y") ? l.slice(0, -1) + "ies" : l + "s");
+const dsTrash = (p) => (p ? "sites/.trash/" + String(p).split("/").pop() : "sites/.trash/");
+const dsSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const dsReduced = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+async function streamNdjson(url, body, onEvent) {
+  const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!r.ok) {
+    const d = (await r.json().catch(() => ({}))).detail;
+    throw new Error(typeof d === "string" ? d : `HTTP ${r.status}`);
+  }
+  const rd = r.body.getReader(), dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await rd.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n")) >= 0) {
+      const ln = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+      if (ln) await onEvent(JSON.parse(ln));
+    }
+  }
+  if (buf.trim()) await onEvent(JSON.parse(buf));
+}
+
+function deleteSiteModal(site) {
+  const isCur = siteData.current && siteData.current.path === site.path;
+  const recorded = (site.active_tenants || []).map((t) => t.name).filter(Boolean);
+  const st = { step: 1, siteName: "", tenants: recorded.length ? recorded.map(() => "") : [""], scan: null, running: false,
+    ok: false, deleted: 0, total: 0, movedTo: null };
+  const wrap = document.createElement("div");
+  wrap.className = "modal-backdrop ds-backdrop";
+  wrap.innerHTML = `<div class="modal ds-modal" role="dialog" aria-modal="true" aria-labelledby="dsTitle">
+    <div class="ds-head"><h3 id="dsTitle">🗑 Delete test site “${esc(site.name)}”</h3>
+      <button class="btn ghost sm ds-x" title="Close (Esc)" aria-label="Close">✕</button></div>
+    <ol class="ds-stepper">${["Confirm names", "Review VMS assets", "Delete", "Done"].map((t, i) =>
+      `<li data-s="${i + 1}"><span class="ds-num">${i + 1}</span><span>${t}</span></li>`).join("")}</ol>
+    <div class="ds-body" aria-live="polite"></div>
+    <div class="btn-row modal-actions ds-actions"></div></div>`;
+  const body = wrap.querySelector(".ds-body"), acts = wrap.querySelector(".ds-actions");
+  const close = () => {
+    if (st.running) return;
+    wrap.remove(); document.removeEventListener("keydown", onKey);
+    if (st.step >= 3) afterSiteDeleted(site, isCur, st);
+  };
+  const onKey = (e) => { if (e.key === "Escape") close(); };
+  wrap.addEventListener("mousedown", (e) => { if (e.target === wrap) close(); });
+  wrap.querySelector(".ds-x").onclick = close;
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(wrap);
+
+  const setStep = (n) => {
+    st.step = n;
+    body.oninput = body.onkeydown = null;   // step 1's handlers must not fire on later steps' inputs
+    wrap.querySelectorAll(".ds-stepper li").forEach((li) => {
+      const s = +li.dataset.s;
+      li.classList.toggle("active", s === n); li.classList.toggle("done", s < n);
+    });
+    body.classList.remove("ds-enter"); void body.offsetWidth; body.classList.add("ds-enter");
+  };
+  const chain = DS_ORDER.map(([, l]) => `<span class="ds-chip">${esc(l)}</span>`).join('<span class="ds-arrow">→</span>');
+
+  // ---------- ① Confirm names ----------
+  function step1() {
+    setStep(1);
+    body.innerHTML = `
+      <p>This deletes the tenant${recorded.length > 1 ? "s" : ""} and everything under ${recorded.length > 1 ? "them" : "it"} on the VMS
+        <code>${esc(site.vms || "?")}</code>. <b>VMS objects can't be restored.</b></p>
+      <p class="small muted">The site's local records are <b>kept</b> - configuration, <code>tenants.yaml</code> and test results stay in the site,
+        which is marked <b>VMS record deleted</b>.</p>
+      <div class="ds-order"><div class="small muted">Assets are deleted in this order:</div>${chain}</div>
+      <label class="ds-field"><span>Type the test site name <code>${esc(site.name)}</code></span>
+        <span class="ds-inwrap"><input data-f="site" autocomplete="off" spellcheck="false" value="${esc(st.siteName)}" placeholder="${esc(site.name)}"><i class="ds-ok">✓</i></span></label>
+      ${st.tenants.map((v, i) => recorded.length
+        ? `<label class="ds-field"><span>Type the tenant name on VMS <code>${esc(recorded[i])}</code></span>
+            <span class="ds-inwrap"><input data-f="tenant" data-i="${i}" autocomplete="off" spellcheck="false" value="${esc(v)}" placeholder="${esc(recorded[i])}"><i class="ds-ok">✓</i></span></label>`
+        : `<label class="ds-field"><span>Type the tenant name on VMS <span class="muted small">- this site has no tenant on record; leave empty if it never created one</span></span>
+            <span class="ds-inwrap"><input data-f="tenant" data-i="${i}" autocomplete="off" spellcheck="false" value="${esc(v)}" placeholder="tenant name"><i class="ds-ok">✓</i></span></label>`).join("")}
+`;
+    acts.innerHTML = `<button class="btn ghost" data-a="cancel">Cancel</button>
+      <button class="btn danger-solid" data-a="scan" disabled>Find assets on VMS →</button>`;
+    const valid = () => {
+      const siteOk = st.siteName.trim() === site.name;
+      body.querySelector('[data-f="site"]').closest(".ds-field").classList.toggle("ok", siteOk);
+      let tOk = true;
+      body.querySelectorAll('[data-f="tenant"]').forEach((el) => {
+        const i = +el.dataset.i, v = st.tenants[i].trim();
+        const good = recorded.length ? v === recorded[i] : true;
+        el.closest(".ds-field").classList.toggle("ok", recorded.length ? good : !!v);
+        tOk = tOk && good;
+      });
+      const btn = acts.querySelector('[data-a="scan"]');
+      btn.disabled = !(siteOk && tOk);
+      btn.textContent = st.tenants.some((t) => t.trim()) ? "Find assets on VMS →" : "Continue →";
+    };
+    body.oninput = (e) => {
+      const el = e.target;
+      if (el.dataset.f === "site") st.siteName = el.value;
+      if (el.dataset.f === "tenant") st.tenants[+el.dataset.i] = el.value;
+      valid();
+    };
+    body.onkeydown = (e) => { if (e.key === "Enter" && !acts.querySelector('[data-a="scan"]').disabled) step2(); };
+    acts.onclick = (e) => {
+      const a = e.target.closest("[data-a]")?.dataset.a;
+      if (a === "cancel") close();
+      if (a === "scan") step2();
+    };
+    valid();
+    setTimeout(() => body.querySelector("input")?.focus(), 60);
+  }
+
+  // ---------- ② Review VMS assets ----------
+  const payload = () => ({ path: site.path, site_name: st.siteName.trim(), tenants: st.tenants.map((t) => t.trim()).filter(Boolean) });
+  async function step2() {
+    setStep(2);
+    const names = payload().tenants;
+    if (!names.length) { st.scan = { tenants: [], vms: site.vms }; return renderReview(); }
+    body.innerHTML = `<div class="ds-scanning"><span class="ds-spin"></span>
+      <div><b>Checking the VMS…</b><div class="small muted ds-ticker">Looking up tenant ${names.map((n) => `“${esc(n)}”`).join(", ")} on <code>${esc(site.vms || "")}</code></div></div></div>`;
+    acts.innerHTML = `<button class="btn ghost" data-a="back">← Back</button>`;
+    acts.onclick = (e) => { if (e.target.closest("[data-a]")?.dataset.a === "back") step1(); };
+    let k = 0;
+    const tick = setInterval(() => {
+      const t = body.querySelector(".ds-ticker");
+      if (!t) return clearInterval(tick);
+      t.textContent = `Listing ${dsLow(dsPlural(DS_ORDER[k++ % DS_ORDER.length][1]))} under the tenant…`;
+    }, 450);
+    try {
+      st.scan = await api("POST", "/api/sites/teardown/scan", payload());
+      clearInterval(tick);
+      if (st.step === 2) renderReview();
+    } catch (err) {
+      clearInterval(tick);
+      if (st.step !== 2) return;
+      body.innerHTML = `<div class="err ds-err"><b>Couldn't check the VMS.</b><br>${esc(err.message)}</div>
+        <p class="small muted">Nothing was deleted. Check the VMS connection, then try again.</p>`;
+      acts.innerHTML = `<button class="btn ghost" data-a="back">← Back</button>
+        <button class="btn primary" data-a="retry">↻ Try again</button>`;
+      acts.onclick = async (e) => {
+        const a = e.target.closest("[data-a]")?.dataset.a;
+        if (a === "back") step1();
+        if (a === "retry") step2();
+      };
+    }
+  }
+
+  const rowId = (t, k) => `${t}|${k}`;
+  function timeline(mode) {
+    // mode "review": what will be deleted; mode "run": the same rows with live status
+    const ts = st.scan.tenants;
+    let n = 0;
+    const html = ts.map((t) => {
+      if (!t.found) return `<div class="ds-tenant"><div class="ds-thead"><b>Tenant “${esc(t.name)}”</b>
+          <span class="pill">not on VMS</span></div><div class="small muted">Not found on the VMS - nothing to delete there${t.recorded ? " (it was probably deleted already)" : ""}.</div></div>`;
+      return `<div class="ds-tenant"><div class="ds-thead"><b>Tenant “${esc(t.name)}”</b> <span class="muted small">id ${esc(t.id)}</span>
+          ${t.recorded ? "" : `<span class="pill warn">not created by this site</span>`}</div>
+        <ol class="ds-timeline">${t.groups.map((g) => {
+          const empty = !g.items.length;
+          return `<li class="ds-row ${empty ? "ds-none" : ""} pending" data-row="${esc(rowId(t.name, g.kind))}" style="--i:${n++}">
+            <span class="ds-dot" aria-hidden="true"></span>
+            <div class="ds-rmain"><div class="ds-rhead"><b>${esc(g.label)}</b>
+              <span class="ds-count">${empty ? "none" : g.items.length}</span><span class="ds-state small muted"></span></div>
+              ${empty ? "" : `<ul class="ds-items">${g.items.map((it) => `<li data-item="${esc(rowId(t.name, g.kind) + "|" + it.id)}">
+                  <span class="ds-ic"></span><span class="ds-iname">${esc(it.name)}</span>${it.detail ? ` <span class="muted small mono">${esc(it.detail)}</span>` : ""}<span class="ds-imsg small"></span></li>`).join("")}</ul>`}
+            </div></li>`;
+        }).join("")}</ol>
+        ${t.notes.length ? `<div class="ds-notes small">${t.notes.map((x) => `<div>ⓘ ${esc(x)}</div>`).join("")}</div>` : ""}</div>`;
+    }).join("");
+    return html + `<ol class="ds-timeline ds-local"><li class="ds-row pending" data-row="local" style="--i:${n}">
+        <span class="ds-dot" aria-hidden="true"></span><div class="ds-rmain"><div class="ds-rhead"><b>Site status → VMS record deleted</b>
+        <span class="ds-state small muted"></span></div>
+        <div class="small muted">Local records are kept: config.yaml, tenants.yaml, saved credentials and test results</div></div></li></ol>`;
+  }
+
+  function renderReview() {
+    const ts = st.scan.tenants;
+    st.total = ts.reduce((a, t) => a + t.groups.reduce((b, g) => b + g.items.length, 0), 0);
+    const foreign = ts.filter((t) => t.found && !t.recorded);
+    const mismatch = ts.filter((t) => t.found && t.recorded && t.recorded_id_matches === false);
+    body.innerHTML = `
+      <p>${st.total ? `<b>${st.total} object${st.total === 1 ? "" : "s"}</b> will be deleted from <code>${esc(st.scan.vms)}</code>, top to bottom.`
+        : "Nothing to delete on the VMS."} The site's local records and test results are kept.</p>
+      ${foreign.length ? `<label class="ds-warn"><input type="checkbox" data-f="foreign">
+          <span>Tenant ${foreign.map((t) => `“${esc(t.name)}”`).join(", ")} is not in this site's records. I'm sure it is the right tenant and want it deleted.</span></label>` : ""}
+      ${mismatch.length ? `<div class="ds-warn">⚠ Tenant ${mismatch.map((t) => `“${esc(t.name)}”`).join(", ")} has a different id on the VMS than this site recorded - it may have been re-created.</div>` : ""}
+      <div class="ds-scroll">${timeline("review")}</div>`;
+    acts.innerHTML = `<button class="btn ghost" data-a="back">← Back</button>
+      <button class="btn danger-solid" data-a="go">${st.total ? `Delete ${st.total} object${st.total === 1 ? "" : "s"} from VMS` : "Mark VMS record deleted"}</button>`;
+    const go = acts.querySelector('[data-a="go"]');
+    const cb = body.querySelector('[data-f="foreign"]');
+    if (cb) { go.disabled = true; cb.onchange = () => { go.disabled = !cb.checked; }; }
+    acts.onclick = (e) => {
+      const a = e.target.closest("[data-a]")?.dataset.a;
+      if (a === "back") step1();
+      if (a === "go" && !go.disabled) step3();
+    };
+  }
+
+  // ---------- ③ Delete (animated) ----------
+  // force: { tenant name: typed "force delete <name>" } - re-runs keeping the timeline that is already on screen
+  async function step3(force = null) {
+    st.running = true;
+    wrap.querySelector(".ds-x").hidden = true;
+    if (force) {
+      body.querySelectorAll(".ds-err, .ds-force").forEach((el) => el.remove());
+      body.querySelector(".ds-now").innerHTML = `<span class="ds-spin sm"></span> <span class="ds-nowtxt">Force deleting…</span>`;
+    } else {
+      setStep(3);
+      st.deleted = 0;
+      body.innerHTML = `<div class="ds-progress"><div class="ds-bar"><i style="width:0%"></i></div>
+          <div class="ds-now small"><span class="ds-spin sm"></span> <span class="ds-nowtxt">Starting…</span></div></div>
+        <div class="ds-scroll">${timeline("run")}</div>`;
+    }
+    acts.innerHTML = `<span class="small muted">Please keep this window open until it finishes.</span>`;
+    const bar = body.querySelector(".ds-bar i"), now = body.querySelector(".ds-nowtxt");
+    const totalSteps = st.total + 1;   // + local records
+    const prog = () => { bar.style.width = `${Math.round((st.deleted / totalSteps) * 100)}%`; };
+    const row = (t, k) => body.querySelector(`[data-row="${CSS.escape(rowId(t, k))}"]`);
+    const setRow = (el, cls, txt) => {
+      if (!el) return;
+      el.classList.remove("pending", "active", "done", "failed", "skipped"); el.classList.add(cls);
+      if (txt != null) el.querySelector(".ds-state").textContent = txt;
+      if (cls === "active") el.scrollIntoView({ block: "nearest", behavior: dsReduced() ? "auto" : "smooth" });
+    };
+    const pace = dsReduced() ? 0 : 260;
+    let stop = null, canForce = null;
+    const onEvent = async (ev) => {
+      if (ev.t === "kind") {
+        const el = row(ev.tenant, ev.kind);
+        const label = DS_ORDER.find(([k]) => k === ev.kind)?.[1] || ev.kind;
+        if (!ev.count) { if (!el?.classList.contains("done")) { setRow(el, "done", "nothing to delete"); await dsSleep(pace / 3); } }
+        else if (ev.kind === "tenant" && force?.[ev.tenant]) { setRow(el, "active", "force deleting…"); now.textContent = `Force deleting tenant “${ev.tenant}”…`; }
+        else { setRow(el, "active", "deleting…"); now.textContent = `Deleting ${dsLow(dsPlural(label))} in tenant “${ev.tenant}”…`; }
+        if (ev.new?.length) toast(`New ${dsLow(label)} found since the review and not deleted: ${ev.new.join(", ")}`, "err", 9000);
+      } else if (ev.t === "item") {
+        const it = body.querySelector(`[data-item="${CSS.escape(rowId(ev.tenant, ev.kind) + "|" + ev.id)}"]`);
+        if (ev.s === "deleting") {
+          it?.classList.add("active");
+          now.textContent = `Deleting ${dsLow(DS_ORDER.find(([k]) => k === ev.kind)?.[1] || ev.kind)} “${ev.name}”…`;
+        } else {
+          it?.classList.remove("active", "failed"); it?.classList.add(ev.s === "failed" ? "failed" : ev.s === "skipped" ? "skipped" : "done");
+          if (it) it.querySelector(".ds-imsg").textContent = ev.msg ? ` - ${ev.msg}` : ev.forced && ev.s !== "failed" ? " - force deleted" : "";
+          if (ev.s !== "failed") { st.deleted++; prog(); }
+          await dsSleep(pace);
+        }
+      } else if (ev.t === "kind_done") {
+        const el = row(ev.tenant, ev.kind);
+        if (el && !el.classList.contains("done")) setRow(el, "done", ev.kind === "tenant" && force?.[ev.tenant] ? "force deleted" : "deleted");
+      } else if (ev.t === "tenant_gone") {
+        now.textContent = `Tenant “${ev.name}” is not on the VMS - nothing to delete there`;
+      } else if (ev.t === "stop") {
+        stop = ev.msg;
+        canForce = ev.can_force ? ev.tenant_name || ev.tenant : null;
+        if (ev.kind) setRow(row(ev.tenant, ev.kind), "failed", "failed");
+      } else if (ev.t === "local") {
+        const el = body.querySelector('[data-row="local"]');
+        if (ev.s === "updating") { setRow(el, "active", "updating…"); now.textContent = "Marking the site “VMS record deleted”…"; await dsSleep(pace); }
+        else { setRow(el, "done", "local records kept"); st.deleted++; prog(); }
+      } else if (ev.t === "done") {
+        st.ok = true;
+      }
+    };
+    try {
+      await streamNdjson("/api/sites/teardown/run", { ...payload(), force: force || {}, plan: Object.fromEntries(st.scan.tenants.filter((t) => t.found)
+        .map((t) => [t.name, Object.fromEntries(t.groups.map((g) => [g.kind, g.items.map((i) => i.id)]))])) }, onEvent);
+    } catch (err) {
+      stop = stop || `Lost contact with the app: ${err.message}. Some objects may already be deleted - scan again to see what is left.`;
+    }
+    st.running = false;
+    wrap.querySelector(".ds-x").hidden = false;
+    if (st.ok) { bar.style.width = "100%"; await dsSleep(dsReduced() ? 0 : 450); return step4(); }
+    if (!stop) stop = "The delete ended without finishing. Scan again to see what is left.";
+    body.querySelector(".ds-now").innerHTML = `<span class="ds-xmark">✕</span> <b>Stopped.</b>`;
+    body.querySelector(".ds-progress").insertAdjacentHTML("afterend", `<div class="err ds-err">${esc(stop)}
+      <div class="small">Nothing after this step was deleted and the site's local records are kept. Fix the problem on the VMS, then try again.</div></div>`);
+    acts.innerHTML = `<button class="btn ghost" data-a="close">Close</button>
+      ${canForce ? `<button class="btn ghost danger" data-a="force">⚠ Force delete tenant…</button>` : ""}
+      <button class="btn primary" data-a="retry">↻ Scan again and continue</button>`;
+    acts.onclick = (e) => {
+      const a = e.target.closest("[data-a]")?.dataset.a;
+      if (a === "close") close();
+      if (a === "retry") step2();
+      if (a === "force") forcePanel(canForce);
+    };
+  }
+
+  // The VMS refused the tenant delete (e.g. "Failed to delete tenant's empty subdirectories ... consider using force").
+  // DELETE /tenants/{id}/?force_remove=true also deletes any files left in the tenant's directory, so the user types
+  // "force delete <tenant name>" first. Every force delete is written to the delete log.
+  function forcePanel(tname) {
+    if (body.querySelector(".ds-force")) return body.querySelector(".ds-force input").focus();
+    const phrase = `force delete ${tname}`;
+    body.querySelector(".ds-err").insertAdjacentHTML("afterend", `<div class="ds-force">
+      <b>⚠ Force delete tenant “${esc(tname)}”</b>
+      <p class="small">The VMS deletes the tenant <b>even if files remain in its directory - those files are deleted permanently</b>.
+        Everything else under the tenant is already gone. This is recorded in the app's delete log.</p>
+      <label class="ds-field"><span>Type <code>${esc(phrase)}</code> to confirm</span>
+        <span class="ds-inwrap"><input data-f="force" autocomplete="off" spellcheck="false" placeholder="${esc(phrase)}"><i class="ds-ok">✓</i></span></label>
+      <div class="btn-row"><button class="btn ghost" data-fa="cancel">Cancel</button>
+        <button class="btn danger-solid" data-fa="go" disabled>Force delete tenant</button></div></div>`);
+    const box = body.querySelector(".ds-force"), inp = box.querySelector("input"), go = box.querySelector('[data-fa="go"]');
+    acts.querySelector('[data-a="force"]').disabled = true;
+    const ok = () => inp.value.trim() === phrase;
+    inp.oninput = () => { go.disabled = !ok(); inp.closest(".ds-field").classList.toggle("ok", ok()); };
+    inp.onkeydown = (e) => { if (e.key === "Enter" && ok()) go.click(); };
+    box.onclick = (e) => {
+      const a = e.target.closest("[data-fa]")?.dataset.fa;
+      if (a === "cancel") { box.remove(); acts.querySelector('[data-a="force"]').disabled = false; }
+      if (a === "go" && ok()) step3({ [tname]: inp.value.trim() });
+    };
+    box.scrollIntoView({ block: "nearest" });
+    setTimeout(() => inp.focus(), 50);
+  }
+
+  // ---------- ④ Done ----------
+  function step4() {
+    setStep(4);
+    wrap.querySelectorAll(".ds-stepper li").forEach((li) => li.classList.add("done"));
+    body.innerHTML = `<div class="ds-done">
+      <svg class="ds-check" viewBox="0 0 52 52" aria-hidden="true"><circle cx="26" cy="26" r="24"/><path d="M15 27 l8 8 l15 -17"/></svg>
+      <h4>VMS records of “${esc(site.name)}” deleted</h4>
+      <p>${st.total ? `${st.deleted - 1} object${st.deleted - 1 === 1 ? "" : "s"} deleted from <code>${esc(st.scan.vms)}</code>.` : "Nothing was on the VMS."}</p>
+      <p class="small muted">The site is kept with its configuration, <code>tenants.yaml</code> and test results, and marked <b>VMS record deleted</b>.
+        Every step is recorded in <a href="#" data-a="log">🗒 Delete log</a>.</p></div>`;
+    acts.innerHTML = `<button class="btn primary" data-a="close">Close</button>`;
+    acts.onclick = () => close();
+    body.querySelector('[data-a="log"]').onclick = (e) => { e.preventDefault(); close(); showDeleteLog(); };
+    acts.querySelector("button").focus();
+  }
+
+  step1();
+}
+
+/* 🗒 Delete log: every site deletion step, kept in sites/.delete-log.jsonl (outside the deleted folders) */
+const DL_TEXT = {
+  delete_site_started: (e) => `Delete site started${e.tenants?.length ? ` - tenant ${e.tenants.join(", ")}` : " - no tenant"}${e.force?.length ? " (force)" : ""}`,
+  delete_object: (e) => `${e.result === "failed" ? "Failed to delete" : e.result === "skipped" ? "Skipped" : "Deleted"} ${dsLow(DS_ORDER.find(([k]) => k === e.kind)?.[1] || e.kind)} “${e.name}”${e.msg ? ` - ${e.msg}` : ""}`,
+  force_delete_tenant_requested: (e) => `Force delete of tenant “${e.tenant}” confirmed by typing “${e.typed}”`,
+  force_delete_tenant: (e) => `${e.result === "failed" ? "Force delete FAILED for" : "FORCE DELETED"} tenant “${e.name}” (id ${e.id})${e.msg ? ` - ${e.msg}` : ""}`,
+  tenant_not_on_vms: (e) => `Tenant “${e.tenant}” not on the VMS - nothing to delete there`,
+  delete_site_stopped: (e) => `Stopped: ${e.msg}`,
+  delete_site_done: (e) => e.kept_local ? "VMS records deleted - site kept with its test results, marked “VMS record deleted”" : `Site deleted - folder moved to ${dsTrash(e.moved_to)}`,
+  delete_site_local_only: (e) => `Local records only deleted - folder moved to ${dsTrash(e.moved_to)}${e.tenants_left_on_vms?.length ? `; left on the VMS: ${e.tenants_left_on_vms.join(", ")}` : ""}`,
+};
+async function showDeleteLog() {
+  const d = await api("GET", "/api/sites/delete-log").catch((e) => { toast(e.message); return null; });
+  if (!d) return;
+  const cls = (e) => (/force_delete_tenant$/.test(e.action) ? "dl-force" : e.result === "failed" || e.action === "delete_site_stopped" ? "dl-fail"
+    : e.action === "delete_site_done" || e.action === "delete_site_local_only" ? "dl-done" : "");
+  await uiConfirm({ title: "🗒 Delete log", ok: "Close", cancel: "", wide: true,
+    html: `<div class="small muted">Every test-site deletion, newest first. Kept in <code>${esc(d.path)}</code>.</div>
+      ${d.entries.length ? `<div class="dl-wrap"><table class="dl"><thead><tr><th>Time</th><th>Site</th><th>What happened</th></tr></thead><tbody>
+        ${d.entries.map((e) => `<tr class="${cls(e)}"><td class="small mono">${esc(fmtDate(e.time))}</td><td>${esc(e.site || "")}
+          <div class="small muted mono">${esc(e.vms || "")}</div></td><td>${esc((DL_TEXT[e.action] || ((x) => x.action))(e))}</td></tr>`).join("")}
+      </tbody></table></div>` : `<div class="empty">No sites deleted yet.</div>`}` });
+}
+
+async function afterSiteDeleted(site, isCur, st) {
+  if (isCur) { loadTenants().catch(() => {}); loadConfig().catch(() => {}); }   // the open site stays open
+  await renderSites();
+  $("#siteListMsg").innerHTML = st.ok
+    ? `<div class="okmsg">✓ VMS records of “${esc(site.name)}” deleted. The site is kept with its test results and moved to the <a href="#" data-sitetab="vmsdel">VMS Record Deleted Sites</a> tab.</div>`
+    : "";
+}
 
 /* Header "⇠ All sites": close the open site and go back to the site list */
 $("#siteBack").onclick = (e) => busy(e.target, async () => {
@@ -2214,7 +2598,7 @@ async function startApp() {
   // Open consoles survive a reload: go back to them. Else the Tenants tab when the site has tenants, else onboarding.
   const d = await loadTenants();
   const last = store.get("tab");
-  showTab(restored && last && $(`.tab[data-tab="${last}"]`) ? last : d.tenants.some((t) => t.status !== "deleted") ? "t4" : "t1");
+  showTab(restored && last && $(`.tab[data-tab="${last}"]`) ? last : d.tenants.some((t) => !tGone(t)) ? "t4" : "t1");
 }
 
 /* ---------------- start ---------------- */

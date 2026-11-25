@@ -45,7 +45,13 @@ def list_(coll: str, req: Request):
     _auth(req)
     items = list(DB.get(coll, {}).values())
     for k, v in req.query_params.items():
-        items = [o for o in items if str(o.get(k)) == v]
+        if k in ("page", "page_size"):
+            continue
+        if k.endswith("__icontains"):
+            f = k[: -len("__icontains")]
+            items = [o for o in items if v.lower() in str(o.get(f, "")).lower()]
+        else:
+            items = [o for o in items if str(o.get(k)) == v]
     return items
 
 

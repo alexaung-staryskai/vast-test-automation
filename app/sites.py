@@ -12,6 +12,7 @@ Any folder with a config.yaml can be opened, so a colleague can copy or unzip a 
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 import shutil
@@ -45,6 +46,21 @@ def list_templates() -> list[dict]:
 
 def _now() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+# Tenant statuses meaning "no longer on the VMS": "deleted" (🧹 Cleanup in tab ①) and
+# "vms record deleted" (🗑 Delete site - VMS objects removed, local records and test results kept).
+VMS_DELETED = "vms record deleted"
+GONE = ("deleted", VMS_DELETED)
+
+
+def mark_vms_deleted(path: Path) -> None:
+    """Delete site keeps the folder (test results) and only records that its VMS objects are gone."""
+    f = path / "site.yaml"
+    meta = (yaml.safe_load(f.read_text()) or {}) if f.is_file() else {}
+    meta.setdefault("name", path.name)
+    meta.update(status=VMS_DELETED, vms_deleted_at=_now())
+    f.write_text(yaml.safe_dump(meta, sort_keys=False))
 
 
 def slug(name: str) -> str:
@@ -81,13 +97,16 @@ def info(path: Path) -> dict:
         "created_at": meta.get("created_at"),
         "path": str(path.resolve()),
         "vms": (cfg.get("vms") or {}).get("url"),
-        "tenants": sum(1 for t in tenants if isinstance(t, dict) and t.get("status") != "deleted"),
+        # "vms record deleted" after 🗑 Delete site - until a new tenant is onboarded in the site
+        "status": meta.get("status") if not any(isinstance(t, dict) and t.get("status") not in GONE for t in tenants) else None,
+        "vms_deleted_at": meta.get("vms_deleted_at"),
+        "tenants": sum(1 for t in tenants if isinstance(t, dict) and t.get("status") not in GONE),
         # tenants still on the VMS - deleting the site only removes local records, so the UI reminds the user
         "active_tenants": [
             {"name": t.get("name"), "vms": t.get("vms"), "tenant_id": t.get("tenant_id"),
              "vip_range": (t.get("vip_pool") or {}).get("range"),
              "objects": [o.get("step") for o in t.get("objects") or [] if isinstance(o, dict)]}
-            for t in tenants if isinstance(t, dict) and t.get("status") != "deleted"],
+            for t in tenants if isinstance(t, dict) and t.get("status") not in GONE],
         "results": len(results),
         "backups": len(list((path / "config-backups").glob("*.yaml"))) if (path / "config-backups").is_dir() else 0,
         "copied_from": meta.get("copied_from"),
@@ -196,3 +215,30 @@ def export_zip(path: Path, include_results: bool = True) -> bytes:
                 continue
             z.write(f, Path(path.name) / rel)
     return buf.getvalue()
+
+
+# ---- app-wide delete log (sites/.delete-log.jsonl): survives the site folder moving to the trash ----
+AUDIT_FILE = SITES_DIR / ".delete-log.jsonl"
+
+
+def audit(**entry) -> None:
+    try:
+        SITES_DIR.mkdir(parents=True, exist_ok=True)
+        with AUDIT_FILE.open("a") as f:
+            f.write(json.dumps({"time": _now(), **entry}, default=str) + "\n")
+    except OSError:
+        pass
+
+
+def read_audit(limit: int = 1000) -> list[dict]:
+    try:
+        lines = AUDIT_FILE.read_text().splitlines()
+    except OSError:
+        return []
+    out = []
+    for ln in lines[-limit:]:
+        try:
+            out.append(json.loads(ln))
+        except ValueError:
+            pass
+    return out[::-1]

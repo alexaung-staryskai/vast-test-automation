@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 
+import httpx
+
 from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -213,10 +215,170 @@ async def delete_site(path: str) -> dict:
             await state.sessions.remove(sid)
         state.close_site()
     try:
+        info = sites.info(Path(path).resolve())
         dest = sites.trash(path)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    sites.audit(action="delete_site_local_only", site=info["name"], vms=info.get("vms"), moved_to=str(dest),
+                tenants_left_on_vms=[t.get("name") for t in info.get("active_tenants") or []])
     return {"ok": True, "moved_to": str(dest)}
+
+
+@app.get("/api/sites/delete-log")
+def site_delete_log() -> dict:
+    """App-wide log of site deletions (kept in sites/.delete-log.jsonl, outside the deleted folders)."""
+    return {"path": str(sites.AUDIT_FILE), "entries": sites.read_audit()}
+
+
+# ---- delete a site together with its tenant(s) on the VMS (🗑 Delete site → modal) ----
+_teardown_busy: set[str] = set()
+
+
+class TeardownIn(BaseModel):
+    path: str
+    site_name: str
+    tenants: list[str] = []                     # tenant names as typed by the user
+    plan: dict[str, dict[str, list]] = {}       # run only: tenant name → kind → reviewed object ids
+    force: dict[str, str] = {}                  # run only: tenant name → typed "force delete <tenant name>"
+
+
+def _teardown_site(body: TeardownIn) -> tuple[Path, dict, TenantStore]:
+    """The site folder, its config and its tenants.yaml, after checking the typed site name."""
+    try:
+        path = sites.resolve(body.path)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if path.parent != sites.SITES_DIR.resolve():
+        raise HTTPException(400, "Only test sites inside the sites folder can be deleted here")
+    name = sites.info(path)["name"]
+    if body.site_name.strip() != name:
+        raise HTTPException(400, f"The site name doesn't match - type “{name}” exactly")
+    if state.site and path == state.site.resolve():
+        prov = state.provisioner
+        if prov is not None and prov.running_all:
+            raise HTTPException(409, "Tenant onboarding is still running on this site - wait for it to finish")
+        cfg = state.cfg
+    else:
+        try:
+            cfg, _ = load_config(path / "config.yaml")
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(400, f"Can't read this site's config.yaml: {e}")
+    names = [t.strip() for t in body.tenants if t.strip()]
+    if len(set(names)) != len(names):
+        raise HTTPException(400, "The same tenant is typed twice")
+    for n in names:
+        if n.lower() == "default":
+            raise HTTPException(400, "The VMS default tenant can't be deleted")
+    return path, cfg, TenantStore.from_cfg(cfg)
+
+
+def _record_for(store: TenantStore, vms_url: str, name: str) -> dict | None:
+    return next((t for t in store.load() if t.get("name") == name and t.get("vms") == vms_url
+                 and t.get("status") not in sites.GONE), None)
+
+
+@app.post("/api/sites/teardown/scan")
+async def teardown_scan(body: TeardownIn) -> dict:
+    """Find the typed tenant(s) on the site's VMS and list everything under them, in deletion order."""
+    from . import teardown
+    path, cfg, store = _teardown_site(body)
+    vms_url = str(cfg["vms"].get("url", "")).rstrip("/")
+    client = VMSClient(cfg)
+    out = []
+    for name in [t.strip() for t in body.tenants if t.strip()]:
+        rec = _record_for(store, vms_url, name)
+        try:
+            tenant = await teardown.find_tenant(client, name)
+            if tenant is None:
+                out.append({"name": name, "found": False, "recorded": bool(rec), "groups": [], "notes": []})
+                continue
+            if tenant.get("id") == 1:
+                raise HTTPException(400, "The VMS default tenant can't be deleted")
+            res = await teardown.scan(client, tenant, rec)
+        except (teardown.TeardownError, httpx.HTTPError) as e:
+            raise HTTPException(502, f"Couldn't read tenant “{name}” from the VMS {vms_url}: {e}")
+        out.append({"name": name, "found": True, "id": tenant["id"], "recorded": bool(rec),
+                    "recorded_id_matches": not rec or rec.get("tenant_id") in (None, tenant["id"]),
+                    "groups": res["groups"], "notes": res["notes"]})
+    return {"vms": vms_url, "site": sites.info(path)["name"], "tenants": out}
+
+
+@app.post("/api/sites/teardown/run")
+async def teardown_run(body: TeardownIn):
+    """Delete the reviewed VMS objects in order, streaming progress as NDJSON, then move the site to the trash."""
+    from fastapi.responses import StreamingResponse
+    from . import teardown
+    path, cfg, store = _teardown_site(body)
+    key = str(path)
+    if key in _teardown_busy:
+        raise HTTPException(409, "This site is already being deleted")
+    vms_url = str(cfg["vms"].get("url", "")).rstrip("/")
+    client = VMSClient(cfg)
+    site_name = sites.info(path)["name"]
+    for name, phrase in body.force.items():
+        if phrase.strip() != f"force delete {name}":
+            raise HTTPException(400, f"To force delete, type “force delete {name}” exactly")
+    log = lambda **e: sites.audit(site=site_name, vms=vms_url, **e)  # noqa: E731
+
+    async def events():
+        _teardown_busy.add(key)
+        line = lambda d: json.dumps(d, default=str) + "\n"  # noqa: E731
+        log(action="delete_site_started", tenants=[t.strip() for t in body.tenants if t.strip()],
+            force=sorted(body.force))
+        try:
+            for name in [t.strip() for t in body.tenants if t.strip()]:
+                rec = _record_for(store, vms_url, name)
+                forced = name in body.force
+                if forced:
+                    log(action="force_delete_tenant_requested", tenant=name, typed=body.force[name])
+                yield line({"t": "tenant", "name": name})
+                try:
+                    tenant = await teardown.find_tenant(client, name)
+                except (teardown.TeardownError, httpx.HTTPError) as e:
+                    yield line({"t": "stop", "msg": f"Couldn't read tenant “{name}” from the VMS: {e}"}); return
+                if tenant is None:
+                    log(action="tenant_not_on_vms", tenant=name)
+                    yield line({"t": "tenant_gone", "name": name})
+                elif tenant.get("id") == 1:
+                    yield line({"t": "stop", "msg": "The VMS default tenant can't be deleted"}); return
+                else:
+                    stopped = False
+                    try:
+                        async for ev in teardown.run(client, tenant, rec, body.plan.get(name, {}), force_tenant=forced):
+                            if ev["t"] == "item" and ev["s"] != "deleting":
+                                log(action="force_delete_tenant" if ev.get("forced") else "delete_object",
+                                    tenant=name, tenant_id=tenant["id"], kind=ev["kind"], id=ev["id"],
+                                    name=ev["name"], result=ev["s"], msg=ev.get("msg") or "")
+                            if ev["t"] == "stop":
+                                log(action="delete_site_stopped", tenant=name, msg=ev["msg"])
+                            yield line({**ev, "tenant": name})
+                            stopped = stopped or ev["t"] == "stop"
+                    except (teardown.TeardownError, httpx.HTTPError) as e:
+                        log(action="delete_site_stopped", tenant=name, msg=f"VMS error: {e}")
+                        yield line({"t": "stop", "msg": f"VMS error: {e}"}); stopped = True
+                    if stopped:
+                        if rec:
+                            store.update(TenantStore.key(rec), status="partial", updated_at=results_now(),
+                                         note="Delete site stopped part-way; some objects remain on the VMS")
+                        return
+                if rec:
+                    store.update(TenantStore.key(rec), status=sites.VMS_DELETED, deleted_at=results_now(), objects=[], note=None)
+            # VMS side is clean. The local records (config, tenants.yaml, test results) are KEPT; the site and its
+            # tenants are only marked "vms record deleted".
+            yield line({"t": "local", "s": "updating"})
+            try:
+                sites.mark_vms_deleted(path)
+            except OSError as e:
+                yield line({"t": "stop", "msg": f"VMS objects deleted, but updating site.yaml failed: {e}"}); return
+            if state.site and path == state.site.resolve() and state.provisioner is not None:
+                state.provisioner.reset()       # the onboarding run's objects no longer exist on the VMS
+            log(action="delete_site_done", kept_local=True)
+            yield line({"t": "local", "s": "updated"})
+            yield line({"t": "done", "ok": True})
+        finally:
+            _teardown_busy.discard(key)
+
+    return StreamingResponse(events(), media_type="application/x-ndjson")
 
 
 @app.post("/api/sites/close")
@@ -811,8 +973,8 @@ def _tenant_on_this_vms(key: str) -> dict:
     rec = next((t for t in state.tenants.load() if TenantStore.key(t) == key), None)
     if not rec:
         raise HTTPException(404, "Unknown tenant")
-    if rec.get("status") == "deleted":
-        raise HTTPException(400, "This tenant was deleted")
+    if rec.get("status") in sites.GONE:
+        raise HTTPException(400, "This tenant was deleted from the VMS")
     if rec.get("vms") != str(state.cfg["vms"].get("url", "")).rstrip("/"):
         raise HTTPException(400, f"This tenant is on {rec.get('vms')}, but the app is connected to "
                                  f"{state.cfg['vms'].get('url')}")
