@@ -33,6 +33,7 @@ RUN_DIR = ROOT / ".run"          # app-<port>.json: pid of the running app, so s
 VENV = ROOT / ".venv"
 REQS = ROOT / "requirements.txt"
 STAMP = VENV / ".requirements.sha256"
+RESTART_EXIT_CODE = 75           # app/main.py exits with this to be started again
 HOST = "127.0.0.1"   # the app holds credentials and shell access: local only
 IS_WIN = os.name == "nt"
 
@@ -230,7 +231,7 @@ def main() -> None:
             return
         die(f"Port {port} is used by another program. Start on another port, e.g.:  run --port 8081")
 
-    env = dict(os.environ, PYTHONUTF8="1")
+    env = dict(os.environ, PYTHONUTF8="1", VAST_LAUNCHER="start.py", VAST_APP_PORT=str(port))
     if site:
         env["VAST_TEST_SITE"] = str(site)
     say(f"Starting on {url}" + (f"  (test site: {site})" if site else ""))
@@ -244,6 +245,18 @@ def main() -> None:
     code = 0
     try:
         code = proc.wait()
+        while code == RESTART_EXIT_CODE:   # the app asked to be restarted (🔄 Restart app, Windows)
+            say("Restarting ...")
+            reopen = RUN_DIR / f"app-{port}.site"
+            if reopen.exists():
+                env["VAST_TEST_SITE"] = reopen.read_text().strip()
+                reopen.unlink(missing_ok=True)
+                if not env["VAST_TEST_SITE"]:
+                    env.pop("VAST_TEST_SITE")
+            proc = subprocess.Popen(cmd, cwd=ROOT, env=env)
+            pidfile.write_text(json.dumps({"pid": proc.pid, "port": port, "site": env.get("VAST_TEST_SITE", ""),
+                                           "started": time.time()}))
+            code = proc.wait()
     except KeyboardInterrupt:
         say("Stopping ...")
         proc.terminate()

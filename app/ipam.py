@@ -126,6 +126,10 @@ async def check(client, vip_cfg: dict, choice_start: str | None = None, auto: bo
     count = max(MIN_IPS, int(vip_cfg.get("ip_count", MIN_IPS)))
     cand_ranges = []
     candidates: list[int] = []
+    from .config import vip_range_problems
+    problems = vip_range_problems(vip_cfg)
+    if problems:
+        raise ValueError("; ".join(problems) + ". Fix it in ⚙ Configuration (vip_pool → ranges), then check again.")
     for r in vip_cfg.get("ranges") or []:
         a, b = ip2int(str(r["start"])), ip2int(str(r["end"]))
         if b < a:

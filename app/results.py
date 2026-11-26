@@ -126,7 +126,16 @@ def _log_entry(stem: str, files: list[Path], perf_groups: set[str]) -> dict:
     if len(ts) == 15 and ts[8] == "-" and ts.replace("-", "").isdigit():
         entry["time"] = f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]}T{ts[9:11]}:{ts[11:13]}:{ts[13:15]}"
     js = next((f for f in files if f.suffix == ".json"), None)
-    if kind.startswith("console-"):
+    if kind == "performance_report":   # PowerPoint performance report (+ its .md summary)
+        clients: list[str] = []
+        md = next((f for f in files if f.suffix == ".md"), None)
+        if md is not None:
+            for line in md.read_text(errors="replace").splitlines():
+                if line.startswith("- Runs:") and "clients:" in line:
+                    clients = [c.strip() for c in line.split("clients:", 1)[1].split(",") if c.strip() and c.strip() != "-"]
+        entry.update(type="report", label="Performance report (PowerPoint)", status="done", clients=clients,
+                     performance=True)
+    elif kind.startswith("console-"):
         entry.update(type="console", label=f"Console export: {kind[len('console-'):]}")
     elif js is not None:
         try:
@@ -151,7 +160,7 @@ def list_logs(perf_groups: set[str]) -> list[dict]:
         return []
     groups: dict[str, list[Path]] = {}
     for p in RESULTS_DIR.iterdir():
-        if p.is_file() and p.suffix in (".json", ".txt", ".md") and not p.name.startswith("."):
+        if p.is_file() and p.suffix in (".json", ".txt", ".md", ".pptx") and not p.name.startswith("."):
             groups.setdefault(p.stem, []).append(p)
     logs = [_log_entry(stem, files, perf_groups) for stem, files in groups.items()]
     logs.sort(key=lambda e: (e.get("time") or "", e["mtime"]), reverse=True)

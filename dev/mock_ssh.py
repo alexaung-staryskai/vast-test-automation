@@ -137,6 +137,8 @@ async def handle(process: asyncssh.SSHServerProcess):
     if cmd.lstrip().startswith("elbencho") and "--version" not in cmd:
         await asyncio.sleep(1)
         process.stdout.write(fake_elbencho(cmd))
+    elif cmd.startswith("hostname; uname -sr"):   # 🔌 Test connection
+        process.stdout.write(f"{user}-mock-client\nLinux 6.8.0-49-generic\nUbuntu 24.04.1 LTS\n")
     elif "fail" in cmd:
         process.stdout.write("[mock] simulated failure\n")
         process.exit(2)

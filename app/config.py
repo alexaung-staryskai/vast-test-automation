@@ -75,6 +75,7 @@ def load_config(path: Path | None = None) -> tuple[dict, list[str]]:
     cfg.setdefault("execution", {})
     cfg.setdefault("command_groups", [])
     cfg.setdefault("vip_pool", {}).setdefault("ranges", [])
+    warnings += [f"{w}. Fix it in ⚙ Configuration (vip_pool → ranges)." for w in vip_range_problems(cfg["vip_pool"])]
     cfg.setdefault("mount", {})
     cfg.setdefault("packages", {}).setdefault("required", [])
     cfg["packages"].setdefault("package_managers", {})
@@ -82,6 +83,32 @@ def load_config(path: Path | None = None) -> tuple[dict, list[str]]:
     cfg["_path"] = str(path)
     cfg["_dir"] = str(path.parent)  # the test site folder; relative paths resolve against it
     return cfg, warnings
+
+
+def vip_range_problems(vip: Any) -> list[str]:
+    """Plain-language problems with vip_pool.ranges (each start/end must be a full IPv4 address, start <= end)."""
+    import ipaddress
+    out: list[str] = []
+    if not isinstance(vip, dict):
+        return out
+    for i, r in enumerate(vip.get("ranges") or []):
+        if not isinstance(r, dict):
+            continue
+        vals = {}
+        for k in ("start", "end"):
+            v = str(r.get(k) or "").strip()
+            if not v or v.startswith("${"):
+                continue
+            try:
+                vals[k] = int(ipaddress.IPv4Address(v))
+            except ValueError:
+                parts = len(v.split("."))
+                hint = f" - it has {parts} number{'s' if parts != 1 else ''}, an IPv4 address needs 4 (e.g. 10.20.0.250)" \
+                    if v.replace(".", "").isdigit() else " - expected an IPv4 address such as 10.20.0.250"
+                out.append(f"vip_pool.ranges #{i + 1} {k} “{v}” is not a valid IP address{hint}")
+        if len(vals) == 2 and vals["end"] < vals["start"]:
+            out.append(f"vip_pool.ranges #{i + 1}: end {r.get('end')} is before start {r.get('start')}")
+    return out
 
 
 def lookup(ctx: dict, dotted: str) -> Any:

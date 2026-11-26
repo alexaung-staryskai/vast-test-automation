@@ -144,9 +144,13 @@ class Provisioner:
 
     # ---------------------------------------------------------------- VIP check
 
-    async def vip_check(self, cfg: dict) -> dict:
+    async def vip_check(self, cfg: dict, map_only: bool = False) -> dict:
+        """map_only: just the IP map (the tenant's VIP pool already exists - its IPs are taken by that pool, so the
+        range chosen before it was created must not be checked again)."""
         vp = cfg.get("vip_pool", {})
         auto = bool(vp.get("auto_select", True))
+        if map_only:
+            return await ipam.check(VMSClient(cfg), vp, None, auto=False)
         return await ipam.check(VMSClient(cfg), vp, None if auto else self.vip_choice, auto=auto)
 
     def vip_ips(self) -> list[str]:

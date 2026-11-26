@@ -4,7 +4,12 @@ The scan lists everything that belongs to the tenant. Most VMS list endpoints do
 object is checked against its own tenant field here. Anything we can't prove belongs to the tenant is left alone.
 
 Deletion order (each step depends on the next ones still existing):
-    view → view policy → S3 user → QoS policy → quota → VIP pool → tenant admin → admin role → tenant
+    view → view policy → S3 user → QoS policy → quota → VIP pool → tenant admin → admin role → tenant → local provider
+
+The local provider ("provider-<tenant>", holds the tenant's local/S3 users) is created with the tenant but the VMS does
+NOT delete it with the tenant, and refuses to delete it while the tenant exists (HTTP 409 "It is forbidden to delete
+VAST provider ..."), so it is the last step. A provider left behind by an earlier delete is found by name
+(see orphan_providers).
 """
 from __future__ import annotations
 
@@ -26,6 +31,7 @@ ORDER: list[tuple[str, str, str]] = [
     ("tenant_admin", "Tenant admin", "/managers/"),
     ("admin_role", "Admin role", "/roles/"),
     ("tenant", "Tenant", "/tenants/"),
+    ("local_provider", "Local provider", "/localproviders/"),   # only deletable once the tenant is gone
 ]
 LABEL = {k: lbl for k, lbl, _ in ORDER}
 ENDPOINT = {k: ep for k, _, ep in ORDER}
@@ -84,6 +90,13 @@ def belongs(kind: str, obj: dict, tenant: dict, ctx: dict) -> bool:
         return ctx.get("provider_id") is not None and _provider_id(obj) == ctx["provider_id"]
     if kind == "tenant_admin":
         return _tid(obj) == tid and obj.get("user_type", "TENANT_ADMIN") == "TENANT_ADMIN"
+    if kind == "local_provider":
+        # only the tenant's own provider, never "default", never one another tenant uses
+        if obj.get("id") in (None, 1) or obj.get("name") == "default" or ctx.get("provider_shared"):
+            return False
+        if str(obj.get("assigned_tenants_preview") or "").strip() not in ("", tenant["name"]):
+            return False
+        return ctx.get("provider_id") is not None and obj.get("id") == ctx["provider_id"]
     if kind == "admin_role":
         tenants = obj.get("tenants")
         if isinstance(tenants, list) and tenants:
@@ -141,6 +154,14 @@ async def scan(client: VMSClient, tenant: dict, record: dict | None) -> dict:
     for kind, label, ep in ORDER:
         if kind == "tenant":
             objs = [tenant]
+        elif kind == "local_provider":
+            objs = []
+            if ctx["provider_id"] is not None:
+                r = await client.request("GET", f"{ep}{ctx['provider_id']}/")
+                if r["ok"] and isinstance(r["body"], dict):
+                    objs = [r["body"]]
+                elif r["status"] != 404:
+                    raise TeardownError(f"GET {ep}{ctx['provider_id']}/ → HTTP {r['status']}: {str(r['body'])[:200]}")
         else:
             params = {"tenant_id": tenant["id"]}
             if kind == "s3_user" and ctx["provider_id"] is not None:
@@ -156,8 +177,8 @@ async def scan(client: VMSClient, tenant: dict, record: dict | None) -> dict:
                        "items": [{"id": o.get("id"), "name": _name(kind, o), "detail": _detail(kind, o)}
                                  for o in mine if o.get("id") is not None]})
     if ctx["provider_shared"]:
-        notes.append("The tenant's local user provider is shared with other tenants, so only the S3 user this "
-                     "site created is deleted.")
+        notes.append("The tenant's local user provider is shared with other tenants, so it is left in place and only "
+                     "the S3 user this site created is deleted.")
     return {"groups": groups, "notes": notes, "ctx": ctx}
 
 
@@ -207,12 +228,20 @@ async def run(client: VMSClient, tenant: dict, record: dict | None, plan: dict[s
     now = {g["kind"]: {i["id"]: i for i in g["items"]} for g in fresh["groups"]}
     for kind, label, _ in ORDER:
         wanted = [i for i in plan.get(kind, []) if i in now.get(kind, {})]
+        if kind == "local_provider":
+            # last step: the tenant is gone now, so check again that no tenant uses the provider, then delete it
+            async for ev in _delete_providers(client, wanted, {i: now[kind][i]["name"] for i in wanted},
+                                              lambda o: belongs("local_provider", o, tenant, ctx)):
+                yield ev
+                if ev["t"] == "stop":
+                    return
+            continue
         new = [i for i in now.get(kind, {}) if i not in plan.get(kind, [])]
         yield {"t": "kind", "kind": kind, "count": len(wanted),
                "new": [now[kind][i]["name"] for i in new]}
         if kind == "tenant" and force_tenant and wanted:
             left = [f"{g['label']} “{i['name']}”" for g in (await scan(client, tenant, record))["groups"]
-                    if g["kind"] != "tenant" for i in g["items"]]
+                    if g["kind"] not in ("tenant", "local_provider") for i in g["items"]]
             if left:
                 yield {"t": "stop", "kind": kind, "msg": "Force delete is only allowed when nothing else is left "
                        f"under the tenant. Still there: {', '.join(left[:6])}{' …' if len(left) > 6 else ''}"}
@@ -233,3 +262,74 @@ async def run(client: VMSClient, tenant: dict, record: dict | None, plan: dict[s
                        "can_force": kind == "tenant" and not forced, "tenant_name": tenant["name"]}
                 return
         yield {"t": "kind_done", "kind": kind}
+
+
+async def _provider_unused(client: VMSClient, pid: Any) -> bool:
+    for t in await list_all(client, "/tenants/"):
+        lp = t.get("local_provider_id")
+        if lp is None and isinstance(t.get("local_provider"), dict):
+            lp = t["local_provider"].get("id")
+        if lp == pid:
+            return False
+    return True
+
+
+async def _delete_providers(client: VMSClient, ids: list, names: dict, owned) -> AsyncIterator[dict]:
+    """Delete local providers once no tenant uses them any more (after the tenant, or left over from before)."""
+    yield {"t": "kind", "kind": "local_provider", "count": len(ids), "new": []}
+    for pid in ids:
+        name = names.get(pid, f"id {pid}")
+        yield {"t": "item", "kind": "local_provider", "id": pid, "name": name, "s": "deleting"}
+        ep = f"{ENDPOINT['local_provider']}{pid}/"
+        try:
+            r = await client.request("GET", ep)
+            if r["status"] == 404:
+                status, msg = "gone", "already gone"
+            elif not r["ok"] or not isinstance(r["body"], dict) or not owned(r["body"]):
+                status, msg = "failed", "no longer matches this tenant - not deleted"
+            elif not await _provider_unused(client, pid):
+                status, msg = "failed", "another tenant uses this provider - not deleted"
+            else:
+                d = await client.request("DELETE", ep)
+                if d["ok"] or d["status"] == 404:
+                    status, msg = ("deleted", "") if d["status"] == 404 or await _wait_gone(client, ep) else \
+                        ("failed", f"the VMS accepted the delete but it still exists after {GONE_TIMEOUT_S}s")
+                else:
+                    m = d["body"]
+                    while isinstance(m, dict) and (m.get("detail") or m.get("error") or m.get("message")):
+                        m = m.get("detail") or m.get("error") or m.get("message")
+                    status, msg = "failed", f"HTTP {d['status']}: {str(m)[:300]}"
+        except httpx.HTTPError as e:
+            status, msg = "failed", f"{type(e).__name__}: {e}"
+        yield {"t": "item", "kind": "local_provider", "id": pid, "name": name, "s": status, "msg": msg}
+        if status == "failed":
+            yield {"t": "stop", "kind": "local_provider", "msg": f"Local provider “{name}”: {msg}"}
+            return
+    yield {"t": "kind_done", "kind": "local_provider"}
+
+
+def _orphan_ok(p: dict, tenant_name: str) -> bool:
+    return (p.get("id") not in (None, 1) and p.get("name") == f"provider-{tenant_name}"
+            and not str(p.get("assigned_tenants_preview") or "").strip())
+
+
+async def orphan_providers(client: VMSClient, tenant_name: str) -> list[dict]:
+    """The tenant is gone from the VMS, but its local provider ("provider-<tenant>") may have been left behind.
+    Only an exact name match that no tenant uses counts."""
+    out = []
+    for p in await list_all(client, "/localproviders/"):
+        if _orphan_ok(p, tenant_name) and await _provider_unused(client, p["id"]):
+            out.append({"id": p["id"], "name": p["name"], "detail": "left behind by an earlier delete - no tenant uses it"})
+    return out
+
+
+async def run_orphans(client: VMSClient, tenant_name: str, plan_ids: list) -> AsyncIterator[dict]:
+    """Delete leftover local providers of a tenant that is already gone (only the reviewed ones that still qualify)."""
+    now = {p["id"]: p for p in await orphan_providers(client, tenant_name)}
+    ids = [i for i in plan_ids if i in now]
+    if not ids:
+        yield {"t": "kind", "kind": "local_provider", "count": 0, "new": []}
+        yield {"t": "kind_done", "kind": "local_provider"}
+        return
+    async for ev in _delete_providers(client, ids, {i: now[i]["name"] for i in ids}, lambda o: _orphan_ok(o, tenant_name)):
+        yield ev

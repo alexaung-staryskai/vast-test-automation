@@ -7,10 +7,13 @@ import secrets
 from fastapi import FastAPI, HTTPException, Request
 
 app = FastAPI()
-IDS = itertools.count(1)
+IDS = itertools.count(2)   # id 1 is the VMS default tenant / provider, as on a real cluster
 DB: dict[str, dict[int, dict]] = {
     # an existing pool so the VIP map shows used IPs
     "vippools": {900: {"id": 900, "name": "existing-pool", "ip_ranges": [["10.20.0.10", "10.20.0.19"]]}},
+    # like a real VMS: the default tenant and its local provider
+    "tenants": {1: {"id": 1, "name": "default", "local_provider_id": 1}},
+    "localproviders": {1: {"id": 1, "name": "default", "assigned_tenants_preview": "default"}},
 }
 BASE = "/api/v8"
 
@@ -62,6 +65,9 @@ async def create(coll: str, req: Request):
     obj = {"id": next(IDS), **body}
     if coll == "tenants":
         obj["local_provider_id"] = 1000 + obj["id"]
+        # like the VMS: the tenant gets its own local provider, which is NOT deleted with the tenant
+        DB.setdefault("localproviders", {})[obj["local_provider_id"]] = {
+            "id": obj["local_provider_id"], "name": f"provider-{obj.get('name')}", "assigned_tenants_preview": obj.get("name")}
     obj.pop("password", None)
     DB.setdefault(coll, {})[obj["id"]] = obj
     return obj
@@ -75,8 +81,20 @@ def get(coll: str, oid: int, req: Request):
     return DB[coll][oid]
 
 
+@app.patch(BASE + "/{coll}/{oid}/")
+async def patch(coll: str, oid: int, req: Request):
+    _auth(req)
+    if oid not in DB.get(coll, {}):
+        raise HTTPException(404, {"detail": "Not found."})
+    DB[coll][oid].update(await req.json())
+    return DB[coll][oid]
+
+
 @app.delete(BASE + "/{coll}/{oid}/", status_code=204)
 def delete(coll: str, oid: int, req: Request):
     _auth(req)
-    if DB.get(coll, {}).pop(oid, None) is None:
+    obj = DB.get(coll, {}).pop(oid, None)
+    if obj is None:
         raise HTTPException(404, {"detail": "Not found."})
+    if coll == "tenants" and obj.get("local_provider_id") in DB.get("localproviders", {}):
+        DB["localproviders"][obj["local_provider_id"]]["assigned_tenants_preview"] = ""   # left behind, unassigned

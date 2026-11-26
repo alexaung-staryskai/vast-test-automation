@@ -166,7 +166,7 @@ for (const ev of ["input", "change"]) $("#vmsForm").addEventListener(ev, () => {
 $("#vmsForm").addEventListener("click", (e) => {
   if (!e.target.classList.contains("eye")) return;
   const inp = e.target.previousElementSibling;
-  inp.type = inp.type === "password" ? "text" : "password";
+  inp.classList.toggle("shown");   // masked text field, not type=password: Chrome's breach check only runs on password fields
 });
 $("#vmsTest").onclick = (e) =>
   busy(e.target, async () => {
@@ -322,7 +322,7 @@ function varField(k, v) {
     inp.addEventListener("blur", async () => { if (inp.value !== CFG.vars[k]) await save(inp.value); close(); });
   } else {
     const shown = typeof v === "object" && v !== null ? JSON.stringify(v) : v;
-    ctl.innerHTML = `<input type="${secret ? "password" : "text"}" value="${esc(shown)}" placeholder="${secret ? "auto-generated" : ""}">`;
+    ctl.innerHTML = `<input type="text"${secret ? ' class="masked" autocomplete="off" spellcheck="false" data-lpignore="true" data-1p-ignore' : ""} value="${esc(shown)}" placeholder="${secret ? "auto-generated" : ""}">`;
     ctl.querySelector("input").addEventListener("change", (e) => save(e.target.value));
   }
   ctl.insertAdjacentHTML("beforeend", '<div class="vwarn" hidden></div>');
@@ -422,6 +422,7 @@ async function loadVipSettings() {
   for (const k of ["ip_count", "subnet_cidr", "vlan"]) f[k].value = v[k];
   f.auto_select.checked = v.auto_select !== false;
   renderVipPick();
+  loadVipCurrent();
 }
 async function applyVipSettings(save, fromSaveAll = false) {
   const f = $("#vipSettings");
@@ -455,7 +456,10 @@ function renderVip() {
   $("#vipSummary").innerHTML = `Candidate ranges <b>${esc(ranges)}</b> · ${d.candidates} IPs, ${d.used_in_candidates} in use ·
     block size <b>${d.ip_count}</b>${d.warnings.length ? `<div class="err">${d.warnings.map(esc).join("<br>")}</div>` : ""}`;
   // one block per /24 (x.x.x.0 - .255), 32 IPs per row, row label = first octet of the row
-  const cellHtml = (c) => {
+  const own = new Set(vipCur?.pool?.ips || []);   // once the pool exists, its IPs are highlighted, not a proposal
+  const cellHtml = (c0) => {
+    const c = !own.size ? c0 : own.has(c0.ip) ? { ...c0, state: "proposed", holder: "this tenant's VIP pool" }
+      : c0.state === "proposed" ? { ...c0, state: "free" } : c0;
     const last = c.ip.split(".").pop();
     const blk = c.state === "free" ? vipBlockFor(c.ip) : null;
     const nofit = c.state === "free" && !blk;   // free, but in a run shorter than the block size
@@ -479,11 +483,12 @@ function renderVip() {
   }).join("");
   const blocks = d.free_blocks.slice(0, 12).map((b) => `${b.start}–${b.end.split(".").pop()} (${b.size})`).join(" · ");
   $("#vipMap").innerHTML = `
-    <div class="proposal">${p ? `${d.auto === false ? "Chosen" : "Auto-selected"} VIP range: <b>${esc(p.start)} – ${esc(p.end)}</b> (${p.count} IPs)`
+    <div class="proposal">${own.size ? `VIP pool <b>${esc(vipCur.pool.name || "")}</b> on the VMS: <b>${esc(vipCur.pool.ips[0])} – ${esc(vipCur.pool.ips[own.size - 1])}</b> (${own.size} IPs, highlighted)`
+      : p ? `${d.auto === false ? "Chosen" : "Auto-selected"} VIP range: <b>${esc(p.start)} – ${esc(p.end)}</b> (${p.count} IPs)`
       : d.auto === false ? `<span class="warn-note">No range chosen yet. Click a free IP to start a block of ${d.ip_count} there.</span>`
       : `<span class="err">No block of ${d.ip_count} free consecutive IPs in the candidate ranges.</span>`}</div>
     <div class="legend"><span><i style="background:var(--ip-free)"></i>free (click: the block of ${d.ip_count} around it)</span>
-      <span><i class="nofit-swatch"></i>free, gap too small</span><span><i style="background:var(--ip-prop)"></i>${d.auto === false ? "chosen" : "proposed"}</span>
+      <span><i class="nofit-swatch"></i>free, gap too small</span><span><i style="background:var(--ip-prop)"></i>${own.size ? "this VIP pool" : d.auto === false ? "chosen" : "proposed"}</span>
       <span><i style="background:var(--ip-used)"></i>used (VIP pool / compute cluster)</span><span><i style="background:var(--ip-ping)"></i>answers ping</span>
       <span><i class="out-swatch"></i>outside candidate ranges</span></div>
     <div class="vipmap">${cells}</div>
@@ -529,6 +534,13 @@ $("#vipMap").addEventListener("click", async (e) => {
     return;
   }
   const blk = vipBlockFor(ip);
+  if (vipCur?.pool) {   // the pool exists: clicking only fills the range fields; "Apply to VMS pool…" changes it
+    const f = $("#vipEdit"), s0 = blk ? n2ip(blk[0]) : ip;
+    f.start.value = s0; f.end.value = n2ip(ip2n(s0) + (vipCur.pool.ips.length || vipData.ip_count) - 1);
+    vipEditCount(); $("#vipEditMsg").innerHTML = '<span class="muted">Check the range, then click <b>Apply to VMS pool…</b></span>';
+    f.scrollIntoView({ block: "nearest" });
+    return;
+  }
   try {
     vipData = await api("POST", "/api/vip/select", { start: blk ? n2ip(blk[0]) : ip }); // the server switches to manual selection
     $("#vipSettings").auto_select.checked = false;
@@ -545,11 +557,101 @@ function renderVipPick() {
     ? `Auto: the first free block is picked when step 1 runs${p ? ` · right now ${range}` : ""}.`
     : p ? `Manual: ${range}`
     : `<span class="warn-note">Manual: no range chosen yet. Open the map and click a free IP.</span>`;
+  if (vipCur?.pool) $("#vipChoiceLine").innerHTML = "";
+  if (vipCur && !vipCur.pool) { vipCur.auto = auto; if (p && !auto) vipCur.choice = { start: p.start, end: p.end, count: p.count }; }
+  renderVipIps();
 }
+/* The VIP IPs on the VIP Pool card: the pool on the VMS once it exists (read live), else the chosen range */
+let vipCur = null;
+const vipChips = (ips) => {
+  const max = 16;
+  return `<div class="vip-chips">${ips.slice(0, max).map((ip) => `<span class="vip-chip mono">${esc(ip)}</span>`).join("")}${ips.length > max ? `<span class="muted small">+${ips.length - max} more</span>` : ""}</div>`;
+};
+const vipRangeIps = (start, end) => { const out = []; for (let n = ip2n(start); n <= ip2n(end) && out.length < 1024; n++) out.push(n2ip(n)); return out; };
+async function loadVipCurrent() {
+  vipCur = await api("GET", "/api/vip/current").catch(() => null);
+  renderVipIps();
+}
+function renderVipIps() {
+  const box = $("#vipIps");
+  if (!box) return;
+  const c = vipCur, pool = c?.pool;
+  $("#vipOpen").textContent = pool ? "🗺 Change VIP range…" : "🗺 Choose VIP range…";
+  if (c) {   // the line next to the button, from the same source as the chips below it
+    const auto = $("#vipSettings").auto_select.checked;
+    $("#vipChoiceLine").innerHTML = pool ? ""
+      : auto ? "Auto: the first free block is picked when step 1 runs."
+      : c.choice || vipData?.proposal ? "Manual: step 1 uses the range below."
+      : `<span class="warn-note">Manual: no range chosen yet. Open the map and click a free IP, or type a range there.</span>`;
+  }
+  let html = "";
+  if (pool) {
+    const r = pool.ips.length ? `<b class="mono">${esc(pool.ips[0])} – ${esc(pool.ips[pool.ips.length - 1])}</b> (${pool.ips.length} IPs)` : "<i>no IPs</i>";
+    html = `<div class="vip-ips-head"><span class="pill passed">on VMS</span> VIP pool <b>${esc(pool.name || "")}</b>: ${r}
+      ${pool.error ? `<span class="err"> · ${esc(pool.error)} - showing the recorded range</span>` : ""}</div>${pool.ips.length ? vipChips(pool.ips) : ""}`;
+  } else {
+    const p = !c?.auto && c?.choice ? c.choice : vipData?.proposal;
+    if (p) html = `<div class="vip-ips-head"><span class="pill">${c?.auto ? "proposed" : "will be used"}</span> VIP IPs for step 1: <b class="mono">${esc(p.start)} – ${esc(p.end)}</b> (${p.count} IPs)</div>${vipChips(vipRangeIps(p.start, p.end))}`;
+  }
+  box.innerHTML = html;
+  box.hidden = !html;
+  fillVipEdit();
+}
+function fillVipEdit(force = false) {
+  const f = $("#vipEdit");
+  if (!f || (!force && (f.contains(document.activeElement)))) return;
+  const pool = vipCur?.pool;
+  const cur = pool?.ips?.length ? { start: pool.ips[0], end: pool.ips[pool.ips.length - 1] }
+    : !vipCur?.auto && vipCur?.choice ? vipCur.choice : vipData?.proposal;
+  if (cur) { f.start.value = cur.start; f.end.value = cur.end; }
+  $("#vipEditTitle").textContent = pool ? `Change the IP range of VIP pool “${pool.name || ""}” on the VMS` : "VIP pool IP range for step 1";
+  $("#vipEditHint").textContent = pool ? "Type a new start and end, or click a free IP on the map below." : "Type a start and end, or click a free IP on the map below.";
+  $("#vipEditGo").textContent = pool ? "Apply to VMS pool…" : "Use this range";
+  $("#vipEditGo").classList.toggle("danger-solid", !!pool); $("#vipEditGo").classList.toggle("primary", !pool);
+  vipEditCount();
+}
+function vipEditCount() {
+  const f = $("#vipEdit");
+  const ok = (v) => /^\d{1,3}(\.\d{1,3}){3}$/.test(v.trim()) && v.trim().split(".").every((o) => +o <= 255);
+  const out = $("#vipEditCount");
+  if (!ok(f.start.value) || !ok(f.end.value)) { out.textContent = ""; return null; }
+  const n = ip2n(f.end.value.trim()) - ip2n(f.start.value.trim()) + 1;
+  out.innerHTML = n < 1 ? '<span class="err">end is before start</span>' : n < 5 ? `<span class="err">${n} IPs - at least 5</span>` : `= ${n} IPs`;
+  return n;
+}
+$("#vipEdit").addEventListener("input", () => { vipEditCount(); $("#vipEditMsg").innerHTML = ""; });
+$("#vipEdit").onsubmit = async (e) => {
+  e.preventDefault();
+  const f = e.target, start = f.start.value.trim(), end = f.end.value.trim();
+  const pool = vipCur?.pool;
+  if (pool) {
+    const old = pool.ips.length ? `${pool.ips[0]} – ${pool.ips[pool.ips.length - 1]}` : "none";
+    const ok = await uiConfirm({ title: `Change VIP pool “${pool.name}” on the VMS?`, ok: "Change VIP pool", danger: true,
+      html: `<p>From <b class="mono">${esc(old)}</b> to <b class="mono">${esc(start)} – ${esc(end)}</b>.</p>
+        <p class="small">Clients mounted through the old VIPs lose their connection - unmount them first and mount again with the new VIPs.
+        The app checks that no other VIP pool or compute cluster uses the new IPs.</p>` });
+    if (!ok) return;
+  }
+  await busy($("#vipEditGo"), async () => {
+    try {
+      const r = await api("POST", "/api/vip/range", { start, end });
+      vipCur = { auto: r.auto, count: r.count, pool: r.pool, choice: r.choice };
+      if (r.check) vipData = r.check;
+      else vipData = await api("POST", "/api/vip/check").catch(() => vipData);
+      if (!r.changed_on_vms) { $("#vipSettings").auto_select.checked = false; $("#vipSettings").ip_count.value = r.count; }
+      renderVipPick(); renderVipIps(); renderVip(); fillVipEdit(true);
+      $("#vipEditMsg").innerHTML = `<span class="okmsg">✓ ${r.changed_on_vms ? `VIP pool changed on the VMS: ${esc(start)} – ${esc(end)}` : `Step 1 will use ${esc(start)} – ${esc(end)} (${r.count} IPs)`}.</span>`;
+      if (r.changed_on_vms) loadTenants();
+    } catch (err) { $("#vipEditMsg").innerHTML = `<span class="err">${esc(err.message)}</span>`; }
+  });
+};
+
 function closeVipModal() { $("#vipModal").hidden = true; document.removeEventListener("keydown", vipModalKey); $("#vipOpen").focus(); }
 function vipModalKey(e) { if (e.key === "Escape") closeVipModal(); }
 $("#vipOpen").onclick = async () => {
   $("#vipModal").hidden = false;
+  $("#vipEditMsg").innerHTML = "";
+  fillVipEdit(true);
   document.addEventListener("keydown", vipModalKey);
   $("#vipClose").focus();
   if (!vipData) $("#vipCheck").click();
@@ -621,6 +723,7 @@ async function refreshProvision() {
   const st = await api("GET", "/api/provision/state");
   provResults = st.results;
   renderSteps();
+  loadVipCurrent();
 }
 
 /* ---- live progress while "Create Tenant" (all steps) is going: poll the server's per-step state ---- */
@@ -744,6 +847,8 @@ function renderClientList() {
       <td class="mono">${esc(c.username)}@${esc(c.host)}${c.port && c.port !== 22 ? ":" + c.port : ""}</td>
       <td class="muted">${c.password_saved ? "🔑 saved" : "from config"}</td>
       <td class="acts"><button class="btn sm" data-connect="${esc(c.name)}">Connect</button>
+        <button class="btn sm ghost" data-ctest="${esc(c.name)}" title="Check that the app can reach and log in to this client">🔌 Test</button>
+        <button class="btn sm ghost" data-cedit="${esc(c.name)}" title="Change name, host, port, user or password">✎ Edit</button>
         <button class="btn sm ghost" data-forget="${esc(c.name)}" title="Remove from this site's client list">Remove</button></td></tr>`).join("")}
     </tbody></table>`;
 }
@@ -751,6 +856,8 @@ $("#clientList").addEventListener("click", async (e) => {
   const b = e.target.closest("button");
   if (!b) return;
   if (b.dataset.connect) return busy(b, () => openConsole({ client: b.dataset.connect }));
+  if (b.dataset.cedit) return clientModal(b.dataset.cedit, false);
+  if (b.dataset.ctest) return clientModal(b.dataset.ctest, true);
   if (b.dataset.forget) {
     const name = b.dataset.forget;
     const ok = await uiConfirm({ title: `Remove client “${name}”?`, ok: "Remove", danger: true,
@@ -783,6 +890,124 @@ $("#customForm").onsubmit = async (e) => {
     }
   } catch (err) { alert(err.message); }
 };
+
+/* ✎ Edit a saved client / 🔌 Test connection. testOnly: just run the check for the saved values. */
+const CT_STEPS = [["dns", "Look up the host name"], ["tcp", "Reach the SSH port"], ["auth", "Log in over SSH"],
+  ["cmd", "Run a command"], ["sudo", "Check sudo"]];
+function clientModal(name, testOnly) {
+  const c = CFG.clients.find((x) => x.name === name);
+  if (!c) return;
+  const wrap = document.createElement("div");
+  wrap.className = "modal-backdrop ds-backdrop";
+  wrap.innerHTML = `<div class="modal ds-modal vf-modal ct-modal" role="dialog" aria-modal="true" aria-labelledby="ctTitle">
+    <div class="ds-head"><h3 id="ctTitle">${testOnly ? `🔌 Test connection - ${esc(name)}` : `✎ Edit client “${esc(name)}”`}</h3>
+      <button class="btn ghost sm ds-x" title="Close (Esc)" aria-label="Close">✕</button></div>
+    ${testOnly ? "" : `<form class="ct-form" autocomplete="off">
+      <label><span>Name</span><input name="name" value="${esc(c.name)}" spellcheck="false"></label>
+      <label><span>Host / IP</span><input name="host" value="${esc(c.host)}" required spellcheck="false"></label>
+      <label class="ct-port"><span>Port</span><input name="port" value="${esc(c.port || 22)}" inputmode="numeric"></label>
+      <label><span>User</span><input name="username" value="${esc(c.username || "")}" spellcheck="false"></label>
+      <label class="ct-pw"><span>Password</span><input name="password" type="text" class="masked" autocomplete="off" spellcheck="false" autocapitalize="off" data-lpignore="true" data-1p-ignore
+        placeholder="${c.password_saved ? "unchanged (saved password)" : "unchanged (from config)"}"></label>
+      ${c.password_saved ? `<label class="ct-check"><input type="checkbox" name="clear_password"> Forget the saved password (use the default from config)</label>` : ""}
+      <div class="small muted ct-note">Open consoles keep their current connection - reconnect them to use the new settings.</div>
+    </form>`}
+    <div class="ct-test" ${testOnly ? "" : "hidden"}></div>
+    <div class="btn-row modal-actions ds-actions"></div></div>`;
+  const form = wrap.querySelector(".ct-form"), box = wrap.querySelector(".ct-test"), acts = wrap.querySelector(".ds-actions");
+  let running = false;
+  const close = () => { if (running) return; wrap.remove(); document.removeEventListener("keydown", onKey); };
+  const onKey = (e) => { if (e.key === "Escape") close(); };
+  wrap.addEventListener("mousedown", (e) => { if (e.target === wrap) close(); });
+  wrap.querySelector(".ds-x").onclick = close;
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(wrap);
+  const values = () => {
+    if (!form) return {};
+    const v = Object.fromEntries(new FormData(form).entries());
+    v.clear_password = !!form.querySelector("[name=clear_password]")?.checked;
+    return v;
+  };
+  const buttons = () => {
+    acts.innerHTML = testOnly
+      ? `<button class="btn ghost" data-a="edit">✎ Edit</button><button class="btn ghost" data-a="test">↻ Test again</button><button class="btn primary" data-a="close">Close</button>`
+      : `<button class="btn ghost" data-a="cancel">Cancel</button><button class="btn" data-a="test">🔌 Test connection</button><button class="btn primary" data-a="save">💾 Save</button>`;
+  };
+  acts.onclick = async (e) => {
+    const a = e.target.closest("[data-a]")?.dataset.a;
+    if (!a || running) return;
+    if (a === "cancel" || a === "close") close();
+    if (a === "edit") { close(); clientModal(name, false); }
+    if (a === "test") runTest();
+    if (a === "save") {
+      if (!form.reportValidity()) return;
+      await busy(e.target, async () => {
+        try {
+          const r = await api("PUT", `/api/clients/${encodeURIComponent(name)}`, values());
+          CFG.clients = r.clients; renderClients();
+          const sel = $("#clientSelect"); if ([...sel.options].some((o) => o.value === r.client.name)) sel.value = r.client.name;
+          toast(`Saved client “${r.client.name}”.`, "ok", 3500);
+          close();
+        } catch (err) { box.hidden = false; box.innerHTML = `<div class="err ds-err">${esc(err.message)}</div>`; }
+      });
+    }
+  };
+  async function runTest() {
+    if (form && !form.reportValidity()) return;
+    running = true; box.hidden = false;
+    wrap.querySelector(".ds-x").hidden = true;
+    acts.querySelectorAll("button").forEach((b) => (b.disabled = true));
+    box.innerHTML = `<div class="ds-progress"><div class="ds-bar"><i style="width:0%"></i></div>
+        <div class="ds-now small"><span class="ds-spin sm"></span> <span class="ds-nowtxt">Starting…</span></div></div>
+      <ol class="ds-timeline ct-list">${CT_STEPS.map(([id, t], i) => `<li class="ds-row pending" data-row="${id}" style="--i:${i}">
+        <span class="ds-dot" aria-hidden="true"></span><div class="ds-rmain"><div class="ds-rhead"><b>${t}</b><span class="ds-state small muted">waiting</span></div>
+        <div class="small muted vf-sub"></div></div></li>`).join("")}</ol>`;
+    const bar = box.querySelector(".ds-bar i"), now = box.querySelector(".ds-nowtxt");
+    const pace = dsReduced() ? 0 : 250;
+    let done = 0, result = null, target = "";
+    const setRow = (id, cls, txt, sub) => {
+      const el = box.querySelector(`[data-row="${id}"]`);
+      el.classList.remove("pending", "active", "done", "failed", "warn"); el.classList.add(cls);
+      el.querySelector(".ds-state").textContent = txt;
+      if (sub != null) el.querySelector(".vf-sub").textContent = sub;
+    };
+    const onEvent = async (ev) => {
+      if (ev.t === "start") {
+        target = `${ev.username}@${ev.host}:${ev.port}`;
+        box.querySelector('[data-row="dns"] .vf-sub').textContent = ev.host;
+        box.querySelector('[data-row="auth"] .vf-sub').textContent = `${ev.username} · ${ev.auth === "keys" ? "SSH key / agent (no password)" : ev.auth === "typed" ? "the password typed above" : ev.auth === "saved" ? "saved password" : "password from config"}`;
+      } else if (ev.t === "step") {
+        const label = CT_STEPS.find(([id]) => id === ev.id)[1];
+        if (ev.s === "running") { setRow(ev.id, "active", "…"); now.textContent = `${label}…`; return; }
+        const cls = ev.s === "ok" ? "done" : ev.s === "warn" ? "warn" : "failed";
+        setRow(ev.id, cls, (ev.s === "ok" ? "ok" : ev.s === "warn" ? "warning" : "failed") + (ev.ms != null ? ` · ${ev.ms} ms` : ""), ev.detail || "");
+        done++; bar.style.width = `${Math.round((done / CT_STEPS.length) * 100)}%`;
+        await dsSleep(pace);
+      } else if (ev.t === "done") result = ev;
+    };
+    let err = null;
+    try { await streamNdjson("/api/clients/test", { saved: name, ...values() }, onEvent); }
+    catch (e) { err = e.message; }
+    running = false;
+    wrap.querySelector(".ds-x").hidden = false;
+    box.querySelectorAll(".ds-row.pending").forEach((r) => { r.classList.add("vf-skip"); r.querySelector(".ds-state").textContent = "not checked"; });
+    bar.style.width = "100%";
+    const nowBox = box.querySelector(".ds-now");
+    if (!err && result?.ok) {
+      bar.classList.add("good");
+      const warn = box.querySelector(".ds-row.warn");
+      nowBox.innerHTML = `<svg class="ds-check vf-check" viewBox="0 0 52 52" aria-hidden="true"><circle cx="26" cy="26" r="24"/><path d="M15 27 l8 8 l15 -17"/></svg>
+        <b>Connected to ${esc(target)}.</b>${warn ? ' <span class="muted">Works - see the sudo note.</span>' : ""}`;
+    } else {
+      bar.classList.add("bad");
+      nowBox.innerHTML = `<span class="ds-xmark">✕</span> <b>${err ? esc(err) : "Can't connect."}</b>${err ? "" : ' <span class="muted">The red step shows why.</span>'}`;
+    }
+    buttons();
+  }
+  buttons();
+  if (testOnly) runTest();
+  else setTimeout(() => form.querySelector("[name=host]").focus(), 50);
+}
 
 async function openConsole(req) {
   const info = await api("POST", "/api/sessions", req);
@@ -1300,6 +1525,78 @@ $("#perfCsv").onclick = () => {
   document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 };
 
+/* 📊 PowerPoint performance report: pick runs and unit → the server builds the deck → it is listed in 🗒 Logs */
+async function perfReportModal() {
+  const d = await api("GET", "/api/logs").catch((e) => { toast(e.message); return null; });
+  if (!d) return;
+  logData = d;
+  const runs = d.logs.filter((l) => l.performance && l.type !== "report" && l.files.some((f) => f.name.endsWith(".json")));
+  if (!runs.length) return toast("No performance runs yet - run Elbencho Write / Read on the consoles first.");
+  const unit = ["MB", "GB", "TB"].includes(perfUnit()) ? perfUnit() : "GB";
+  const wrap = document.createElement("div");
+  wrap.className = "modal-backdrop ds-backdrop";
+  wrap.innerHTML = `<div class="modal ds-modal vf-modal pr-modal" role="dialog" aria-modal="true" aria-labelledby="prTitle">
+    <div class="ds-head"><h3 id="prTitle">📊 Performance report (PowerPoint)</h3>
+      <button class="btn ghost sm ds-x" title="Close (Esc)" aria-label="Close">✕</button></div>
+    <div class="ds-body">
+      <p class="small muted">Charts and tables of the runs you pick, in the same template as the tester manual. Throughput is summed across clients.
+        The report is saved in this site's results and listed in <b>🗒 Logs</b>.</p>
+      <div class="pr-tools small"><label><input type="checkbox" class="pr-all" checked> All runs</label>
+        <label>Unit <select class="pr-unit">${["MB", "GB", "TB"].map((u) => `<option ${u === unit ? "selected" : ""}>${u}</option>`).join("")}</select> /s</label></div>
+      <div class="pr-runs">${runs.map((l) => `<label class="pr-run"><input type="checkbox" value="${esc(l.id)}" checked>
+        <span><b>${esc(l.label)}</b> <span class="pill ${esc(l.status)}">${esc(l.status)}</span>
+        <span class="muted small">${esc(new Date(l.time || l.mtime * 1000).toLocaleString())} · ${esc(l.clients.filter(Boolean).join(", "))}</span></span></label>`).join("")}</div>
+      <div class="pr-out"></div>
+    </div>
+    <div class="btn-row modal-actions ds-actions"></div></div>`;
+  const body = wrap.querySelector(".ds-body"), acts = wrap.querySelector(".ds-actions"), out = wrap.querySelector(".pr-out");
+  let busyNow = false;
+  const close = () => { if (busyNow) return; wrap.remove(); document.removeEventListener("keydown", onKey); };
+  const onKey = (e) => { if (e.key === "Escape") close(); };
+  wrap.addEventListener("mousedown", (e) => { if (e.target === wrap) close(); });
+  wrap.querySelector(".ds-x").onclick = close;
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(wrap);
+  const boxes = () => [...body.querySelectorAll(".pr-run input")];
+  const sync = () => {
+    const n = boxes().filter((b) => b.checked).length;
+    body.querySelector(".pr-all").checked = n === boxes().length;
+    acts.querySelector('[data-a="go"]').disabled = !n;
+    acts.querySelector('[data-a="go"]').textContent = `📊 Generate report (${n} run${n === 1 ? "" : "s"})`;
+  };
+  body.querySelector(".pr-all").onchange = (e) => { boxes().forEach((b) => (b.checked = e.target.checked)); sync(); };
+  body.querySelector(".pr-runs").onchange = sync;
+  acts.innerHTML = `<button class="btn ghost" data-a="cancel">Cancel</button><button class="btn primary" data-a="go"></button>`;
+  sync();
+  acts.onclick = async (e) => {
+    const a = e.target.closest("[data-a]")?.dataset.a;
+    if (a === "cancel" || a === "close") return close();
+    if (a === "logs") { close(); logSel = { id: e.target.closest("[data-id]").dataset.id, file: null }; showTab("t5"); loadResults(); return; }
+    if (a !== "go") return;
+    busyNow = true;
+    wrap.querySelector(".ds-x").hidden = true;
+    acts.querySelectorAll("button").forEach((b) => (b.disabled = true));
+    out.innerHTML = `<div class="ds-now small"><span class="ds-spin sm"></span> Building the PowerPoint - charts, tables and test setup…</div>`;
+    try {
+      const r = await api("POST", "/api/reports/performance", { runs: boxes().filter((b) => b.checked).map((b) => b.value), unit: body.querySelector(".pr-unit").value });
+      out.innerHTML = `<div class="pr-done"><svg class="ds-check vf-check" viewBox="0 0 52 52" aria-hidden="true"><circle cx="26" cy="26" r="24"/><path d="M15 27 l8 8 l15 -17"/></svg>
+        <div><b>Report ready</b> - ${r.slides} slides from ${r.runs} run${r.runs === 1 ? "" : "s"}<div class="mono small">${esc(r.file)}</div></div></div>`;
+      acts.innerHTML = `<button class="btn ghost" data-a="logs" data-id="${esc(r.log_id)}">🗒 Open in Logs</button>
+        <a class="btn primary" href="/api/results/${encodeURIComponent(r.file)}" download>⤓ Download PowerPoint</a>
+        <button class="btn ghost" data-a="close">Close</button>`;
+      loadResults();   // the new report appears in 🗒 Logs and in Performance result files
+    } catch (err) {
+      out.innerHTML = `<div class="err ds-err">${esc(err.message)}</div>`;
+      acts.innerHTML = `<button class="btn ghost" data-a="cancel">Close</button><button class="btn primary" data-a="go"></button>`;
+      sync();
+    }
+    busyNow = false;
+    wrap.querySelector(".ds-x").hidden = false;
+  };
+}
+$("#perfReport").onclick = perfReportModal;
+$("#logsReport").onclick = perfReportModal;
+
 /* links like <a data-goto="t5"> outside the site screen */
 $("#t2").addEventListener("click", (e) => { if (e.target.dataset?.goto) { e.preventDefault(); showTab(e.target.dataset.goto); } });
 
@@ -1370,7 +1667,7 @@ async function showLog() {
   const box = $("#logView");
   const l = logData.logs.find((x) => x.id === logSel.id);
   if (!l) { box.className = "logview-empty muted"; box.textContent = "Select a log on the left to read it here."; return; }
-  const pref = ["txt", "md", "json"];
+  const pref = ["txt", "md", "json", "pptx"];
   const file = l.files.find((f) => f.name === logSel.file) || [...l.files].sort((a, b) => pref.indexOf(a.name.split(".").pop()) - pref.indexOf(b.name.split(".").pop()))[0];
   logSel.file = file.name;
   const ext = file.name.split(".").pop();
@@ -1386,6 +1683,14 @@ async function showLog() {
       </div></div>
     <pre class="lv-body ${ext}"><span class="muted">Loading ${esc(file.name)}…</span></pre>`;
   const token = ++logViewToken;
+  if (ext === "pptx") {   // a PowerPoint report: a download panel instead of text
+    $(".lv-body", box).outerHTML = `<div class="lv-pptx"><div class="lv-pptx-icon" aria-hidden="true">📊</div>
+      <div><b>${esc(file.name)}</b><div class="muted small">PowerPoint · ${fmtSize(file.size)}</div>
+      <a class="btn primary" href="/api/results/${encodeURIComponent(file.name)}" download>⤓ Download PowerPoint</a>
+      ${l.files.some((f) => f.name.endsWith(".md")) ? `<div class="small muted">The <b>md</b> button shows the report's summary table.</div>` : ""}</div></div>`;
+    $("#lvCopy", box).hidden = true;
+    return;
+  }
   let text;
   try { text = await (await fetch(`/api/results/${encodeURIComponent(file.name)}`)).text(); }
   catch (e) { text = `Could not load ${file.name}: ${e.message}`; }
@@ -1629,7 +1934,7 @@ $("#tenantList").addEventListener("click", async (e) => {
     out.dataset.shown = shown ? "" : "1";
     return;
   }
-  if (act === "verify") await busy(e.target, async () => { await api("POST", "/api/tenants/verify", { key }); await loadTenants(); });
+  if (act === "verify") return verifyModal(key, e.target.closest(".tenant")?.querySelector("h2")?.firstChild?.textContent?.trim() || key.split("@")[0]);
   if (act === "remove" && await uiConfirm({ title: `Remove ${key.split("@")[0]} from the list?`, ok: "Remove from list", danger: true,
       html: `Removes the record from <code>tenants.yaml</code> only. <b>Nothing is deleted on the VMS</b> - delete the tenant there manually (${esc(key.split("@")[1])}).` }))
     await busy(e.target, async () => { await api("DELETE", `/api/tenants?key=${encodeURIComponent(key)}`); await loadTenants(); });
@@ -1730,7 +2035,7 @@ function fieldFor(key, val, path, wide = false) {
     const long = String(s).length > 60;
     wrap.innerHTML = long
       ? `${esc(key)}<textarea rows="2">${esc(s)}</textarea>`
-      : `${esc(key)}<input type="${secret ? "password" : "text"}" value="${esc(s)}">`;
+      : `${esc(key)}<input type="text"${secret ? ' class="masked" autocomplete="off" spellcheck="false" data-lpignore="true" data-1p-ignore' : ""} value="${esc(s)}">`;
     if (long) wrap.classList.add("wide");
     const inp = wrap.querySelector("input,textarea");
     inp.onchange = (e) => { setAt(path, e.target.value); e.target.classList.add("changed"); };
@@ -2101,7 +2406,8 @@ async function renderSites() {
           <td class="mono small folder" title="${esc(s.path)}">${esc(s.path.split("/").slice(-2).join("/"))}</td>
           <td class="acts">${isCur ? `<button class="btn sm" disabled>Opened</button>`
             : `<button class="btn sm ${s.path === siteData.last ? "primary" : ""}" data-open="${esc(s.path)}">Open site</button>`}
-            ${s.status === "vms record deleted" ? "" : `<button class="btn sm ghost danger" data-del="${esc(s.path)}" data-name="${esc(s.name)}"
+            ${s.status === "vms record deleted" ? `<button class="btn sm ghost" data-del="${esc(s.path)}" data-name="${esc(s.name)}"
+              title="Look on the VMS for anything the earlier delete left behind (e.g. the tenant's local provider) and delete it">🧹 Check VMS for leftovers</button>` : `<button class="btn sm ghost danger" data-del="${esc(s.path)}" data-name="${esc(s.name)}"
               title="Delete the tenant and its assets from the VMS. The site's local records and test results are kept.">Delete site</button>`}</td>
         </tr>`;
       }).join("")}</tbody></table>`
@@ -2204,8 +2510,8 @@ $("#siteList").addEventListener("click", async (e) => {
 /* ---- 🗑 Delete site: a 4-step modal. ① type the site + tenant names → ② scan the tenant on the VMS and review
    everything under it → ③ delete in order, animated → ④ done (folder moved to sites/.trash/). ---- */
 const DS_ORDER = [["view", "View"], ["view_policy", "View policy"], ["s3_user", "S3 user"], ["qos", "QoS policy"],
-  ["quota", "Quota"], ["vippool", "VIP pool"], ["tenant_admin", "Tenant admin"], ["admin_role", "Admin role"], ["tenant", "Tenant"]];
-const dsLow = (l) => l.replace(/^(View|Quota|Tenant|Admin)\b/, (m) => m.toLowerCase());          // "View policy" → "view policy", "S3 user" stays
+  ["quota", "Quota"], ["vippool", "VIP pool"], ["tenant_admin", "Tenant admin"], ["admin_role", "Admin role"], ["tenant", "Tenant"], ["local_provider", "Local provider"]];
+const dsLow = (l) => l.replace(/^(View|Quota|Tenant|Admin|Local)\b/, (m) => m.toLowerCase());          // "View policy" → "view policy", "S3 user" stays
 const dsPlural = (l) => (l.endsWith("y") ? l.slice(0, -1) + "ies" : l + "s");
 const dsTrash = (p) => (p ? "sites/.trash/" + String(p).split("/").pop() : "sites/.trash/");
 const dsSleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -2234,13 +2540,14 @@ async function streamNdjson(url, body, onEvent) {
 
 function deleteSiteModal(site) {
   const isCur = siteData.current && siteData.current.path === site.path;
-  const recorded = (site.active_tenants || []).map((t) => t.name).filter(Boolean);
+  const leftovers = site.status === "vms record deleted";   // 🧹 Check VMS for leftovers on an already-deleted site
+  const recorded = (leftovers ? site.deleted_tenants || [] : (site.active_tenants || []).map((t) => t.name)).filter(Boolean);
   const st = { step: 1, siteName: "", tenants: recorded.length ? recorded.map(() => "") : [""], scan: null, running: false,
     ok: false, deleted: 0, total: 0, movedTo: null };
   const wrap = document.createElement("div");
   wrap.className = "modal-backdrop ds-backdrop";
   wrap.innerHTML = `<div class="modal ds-modal" role="dialog" aria-modal="true" aria-labelledby="dsTitle">
-    <div class="ds-head"><h3 id="dsTitle">🗑 Delete test site “${esc(site.name)}”</h3>
+    <div class="ds-head"><h3 id="dsTitle">${leftovers ? `🧹 Check VMS for leftovers - “${esc(site.name)}”` : `🗑 Delete test site “${esc(site.name)}”`}</h3>
       <button class="btn ghost sm ds-x" title="Close (Esc)" aria-label="Close">✕</button></div>
     <ol class="ds-stepper">${["Confirm names", "Review VMS assets", "Delete", "Done"].map((t, i) =>
       `<li data-s="${i + 1}"><span class="ds-num">${i + 1}</span><span>${t}</span></li>`).join("")}</ol>
@@ -2272,9 +2579,12 @@ function deleteSiteModal(site) {
   // ---------- ① Confirm names ----------
   function step1() {
     setStep(1);
-    body.innerHTML = `
+    body.innerHTML = (leftovers ? `
+      <p>This site's tenant was already deleted from the VMS <code>${esc(site.vms || "?")}</code>. The app looks for anything that was
+        left behind - such as the tenant's local provider <code>provider-&lt;tenant&gt;</code> - and deletes it after you review it.
+        <b>VMS objects can't be restored.</b></p>` : `
       <p>This deletes the tenant${recorded.length > 1 ? "s" : ""} and everything under ${recorded.length > 1 ? "them" : "it"} on the VMS
-        <code>${esc(site.vms || "?")}</code>. <b>VMS objects can't be restored.</b></p>
+        <code>${esc(site.vms || "?")}</code>. <b>VMS objects can't be restored.</b></p>`) + `
       <p class="small muted">The site's local records are <b>kept</b> - configuration, <code>tenants.yaml</code> and test results stay in the site,
         which is marked <b>VMS record deleted</b>.</p>
       <div class="ds-order"><div class="small muted">Assets are deleted in this order:</div>${chain}</div>
@@ -2359,10 +2669,12 @@ function deleteSiteModal(site) {
     const ts = st.scan.tenants;
     let n = 0;
     const html = ts.map((t) => {
-      if (!t.found) return `<div class="ds-tenant"><div class="ds-thead"><b>Tenant “${esc(t.name)}”</b>
+      const left = (t.groups || []).filter((g) => g.items.length);
+      if (!t.found && !left.length) return `<div class="ds-tenant"><div class="ds-thead"><b>Tenant “${esc(t.name)}”</b>
           <span class="pill">not on VMS</span></div><div class="small muted">Not found on the VMS - nothing to delete there${t.recorded ? " (it was probably deleted already)" : ""}.</div></div>`;
-      return `<div class="ds-tenant"><div class="ds-thead"><b>Tenant “${esc(t.name)}”</b> <span class="muted small">id ${esc(t.id)}</span>
-          ${t.recorded ? "" : `<span class="pill warn">not created by this site</span>`}</div>
+      return `<div class="ds-tenant"><div class="ds-thead"><b>Tenant “${esc(t.name)}”</b> ${t.found ? `<span class="muted small">id ${esc(t.id)}</span>` : `<span class="pill">not on VMS</span>`}
+          ${t.recorded || !t.found ? "" : `<span class="pill warn">not created by this site</span>`}</div>
+        ${t.found ? "" : `<div class="small muted ds-leftnote">The tenant is already gone, but its local provider was left behind on the VMS.</div>`}
         <ol class="ds-timeline">${t.groups.map((g) => {
           const empty = !g.items.length;
           return `<li class="ds-row ${empty ? "ds-none" : ""} pending" data-row="${esc(rowId(t.name, g.kind))}" style="--i:${n++}">
@@ -2394,14 +2706,16 @@ function deleteSiteModal(site) {
       ${mismatch.length ? `<div class="ds-warn">⚠ Tenant ${mismatch.map((t) => `“${esc(t.name)}”`).join(", ")} has a different id on the VMS than this site recorded - it may have been re-created.</div>` : ""}
       <div class="ds-scroll">${timeline("review")}</div>`;
     acts.innerHTML = `<button class="btn ghost" data-a="back">← Back</button>
-      <button class="btn danger-solid" data-a="go">${st.total ? `Delete ${st.total} object${st.total === 1 ? "" : "s"} from VMS` : "Mark VMS record deleted"}</button>`;
+      ${leftovers && !st.total ? `<button class="btn primary" data-a="close">✓ Nothing left on the VMS - close</button>`
+        : `<button class="btn danger-solid" data-a="go">${st.total ? `Delete ${st.total} object${st.total === 1 ? "" : "s"} from VMS` : "Mark VMS record deleted"}</button>`}`;
     const go = acts.querySelector('[data-a="go"]');
     const cb = body.querySelector('[data-f="foreign"]');
-    if (cb) { go.disabled = true; cb.onchange = () => { go.disabled = !cb.checked; }; }
+    if (cb && go) { go.disabled = true; cb.onchange = () => { go.disabled = !cb.checked; }; }
     acts.onclick = (e) => {
       const a = e.target.closest("[data-a]")?.dataset.a;
       if (a === "back") step1();
-      if (a === "go" && !go.disabled) step3();
+      if (a === "close") close();
+      if (a === "go" && go && !go.disabled) step3();
     };
   }
 
@@ -2470,7 +2784,7 @@ function deleteSiteModal(site) {
       }
     };
     try {
-      await streamNdjson("/api/sites/teardown/run", { ...payload(), force: force || {}, plan: Object.fromEntries(st.scan.tenants.filter((t) => t.found)
+      await streamNdjson("/api/sites/teardown/run", { ...payload(), force: force || {}, plan: Object.fromEntries(st.scan.tenants.filter((t) => t.found || (t.groups || []).some((g) => g.items.length))
         .map((t) => [t.name, Object.fromEntries(t.groups.map((g) => [g.kind, g.items.map((i) => i.id)]))])) }, onEvent);
     } catch (err) {
       stop = stop || `Lost contact with the app: ${err.message}. Some objects may already be deleted - scan again to see what is left.`;
@@ -2527,7 +2841,7 @@ function deleteSiteModal(site) {
     wrap.querySelectorAll(".ds-stepper li").forEach((li) => li.classList.add("done"));
     body.innerHTML = `<div class="ds-done">
       <svg class="ds-check" viewBox="0 0 52 52" aria-hidden="true"><circle cx="26" cy="26" r="24"/><path d="M15 27 l8 8 l15 -17"/></svg>
-      <h4>VMS records of “${esc(site.name)}” deleted</h4>
+      <h4>${leftovers ? `Leftovers of “${esc(site.name)}” deleted from the VMS` : `VMS records of “${esc(site.name)}” deleted`}</h4>
       <p>${st.total ? `${st.deleted - 1} object${st.deleted - 1 === 1 ? "" : "s"} deleted from <code>${esc(st.scan.vms)}</code>.` : "Nothing was on the VMS."}</p>
       <p class="small muted">The site is kept with its configuration, <code>tenants.yaml</code> and test results, and marked <b>VMS record deleted</b>.
         Every step is recorded in <a href="#" data-a="log">🗒 Delete log</a>.</p></div>`;
@@ -2540,10 +2854,128 @@ function deleteSiteModal(site) {
   step1();
 }
 
+/* ---- ✓ Verify on VMS: a modal that shows each check as it runs (streamed from /api/tenants/verify/stream):
+   connect to the VMS → GET every object onboarding created → result saved to tenants.yaml. ---- */
+function verifyModal(key, tname) {
+  const st = { running: false, ok: null };
+  const wrap = document.createElement("div");
+  wrap.className = "modal-backdrop ds-backdrop";
+  wrap.innerHTML = `<div class="modal ds-modal vf-modal" role="dialog" aria-modal="true" aria-labelledby="vfTitle">
+    <div class="ds-head"><h3 id="vfTitle">✓ Verify tenant “${esc(tname)}” on VMS</h3>
+      <button class="btn ghost sm ds-x" title="Close (Esc)" aria-label="Close">✕</button></div>
+    <div class="ds-body" aria-live="polite"></div>
+    <div class="btn-row modal-actions ds-actions"></div></div>`;
+  const body = wrap.querySelector(".ds-body"), acts = wrap.querySelector(".ds-actions");
+  const close = () => {
+    if (st.running) return;
+    wrap.remove(); document.removeEventListener("keydown", onKey);
+    loadTenants();
+  };
+  const onKey = (e) => { if (e.key === "Escape") close(); };
+  wrap.addEventListener("mousedown", (e) => { if (e.target === wrap) close(); });
+  wrap.querySelector(".ds-x").onclick = close;
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(wrap);
+  const pace = dsReduced() ? 0 : 280;
+
+  async function run() {
+    st.running = true; st.ok = null;
+    wrap.querySelector(".ds-x").hidden = true;
+    body.innerHTML = `<div class="ds-progress"><div class="ds-bar"><i style="width:0%"></i></div>
+        <div class="ds-now small"><span class="ds-spin sm"></span> <span class="ds-nowtxt">Starting…</span></div></div>
+      <div class="ds-scroll"><ol class="ds-timeline vf-list"></ol></div>`;
+    acts.innerHTML = `<span class="small muted">Checking - read-only, nothing is changed on the VMS.</span>`;
+    const bar = body.querySelector(".ds-bar i"), now = body.querySelector(".ds-nowtxt"), list = body.querySelector(".vf-list");
+    let total = 1, doneN = 0, result = null, vms = "";
+    const prog = () => { bar.style.width = `${Math.round((doneN / total) * 100)}%`; };
+    const rowEl = (id) => list.querySelector(`[data-row="${CSS.escape(id)}"]`);
+    const setRow = (el, cls, txt, sub) => {
+      if (!el) return;
+      el.classList.remove("pending", "active", "done", "failed"); el.classList.add(cls);
+      if (txt != null) el.querySelector(".ds-state").textContent = txt;
+      if (sub != null) el.querySelector(".vf-sub").innerHTML = sub;
+      if (cls === "active") el.scrollIntoView({ block: "nearest", behavior: dsReduced() ? "auto" : "smooth" });
+    };
+    const addRow = (id, title, sub, i) => list.insertAdjacentHTML("beforeend",
+      `<li class="ds-row pending" data-row="${esc(id)}" style="--i:${i}"><span class="ds-dot" aria-hidden="true"></span>
+        <div class="ds-rmain"><div class="ds-rhead"><b>${title}</b><span class="ds-state small muted">waiting</span></div>
+        <div class="small muted vf-sub">${sub}</div></div></li>`);
+    const fmtFound = (f) => !f ? "" : Object.entries(f).filter(([k]) => k !== "username" || !f.name)
+      .map(([k, v]) => k === "id" ? `id ${esc(v)}` : k === "name" || k === "username" ? `“${esc(v)}”` : esc(v)).join(" · ");
+    const onEvent = async (ev) => {
+      if (ev.t === "start") {
+        vms = ev.vms; total = ev.objects.length + 1;
+        addRow("connect", "Connect to the VMS", `<code>${esc(ev.vms)}</code>`, 0);
+        ev.objects.forEach((o, i) => addRow("o|" + o.step, esc(o.name), `GET <code>${esc(o.endpoint)}</code>`, i + 1));
+        addRow("save", "Save the result", "to this site's tenants.yaml", total);
+        if (!ev.objects.length) now.textContent = "This tenant has no recorded objects to check.";
+        await dsSleep(pace);
+      } else if (ev.t === "connect") {
+        const el = rowEl("connect");
+        if (ev.s === "checking") { setRow(el, "active", "connecting…"); now.textContent = `Connecting to ${vms}…`; }
+        else {
+          setRow(el, ev.s === "ok" ? "done" : "failed", ev.s === "ok" ? `connected · ${ev.ms} ms` : "can't connect",
+            ev.s === "ok" ? `<code>${esc(vms)}</code>${ev.detail ? " · " + esc(ev.detail) : ""}` : `<span class="err">${esc(ev.detail)}</span>`);
+          if (ev.s === "ok") { doneN++; prog(); }
+          await dsSleep(pace);
+        }
+      } else if (ev.t === "check") {
+        const el = rowEl("o|" + ev.step);
+        const name = el?.querySelector(".ds-rhead b").textContent || ev.step;
+        if (ev.s === "checking") { setRow(el, "active", "checking…"); now.textContent = `Checking ${name}…`; }
+        else {
+          const good = ev.s === "present";
+          setRow(el, good ? "done" : "failed", good ? `present · ${ev.ms} ms` : ev.s === "missing" ? "missing on VMS" : ev.s,
+            good && ev.found ? `${el.querySelector(".vf-sub").innerHTML} → ${fmtFound(ev.found)}` : null);
+          doneN++; prog();
+          await dsSleep(pace);
+        }
+      } else if (ev.t === "done") {
+        result = ev;
+        if (!ev.connect_failed) { const el = rowEl("save"); setRow(el, "active", "saving…"); await dsSleep(pace / 2); setRow(el, "done", "saved"); }
+      }
+    };
+    let err = null;
+    try { await streamNdjson("/api/tenants/verify/stream", { key }, onEvent); }
+    catch (e) { err = e.message; }
+    st.running = false;
+    wrap.querySelector(".ds-x").hidden = false;
+    bar.style.width = "100%";
+    const nowBox = body.querySelector(".ds-now");
+    list.querySelectorAll(".ds-row.pending").forEach((r) => { r.classList.add("vf-skip"); r.querySelector(".ds-state").textContent = "not checked"; });
+    if (err || !result) {
+      nowBox.innerHTML = `<span class="ds-xmark">✕</span> <b>Couldn't verify.</b>`;
+      body.querySelector(".ds-progress").insertAdjacentHTML("afterend", `<div class="err ds-err">${esc(err || "The check ended early.")}</div>`);
+      bar.classList.add("bad");
+    } else if (result.connect_failed) {
+      nowBox.innerHTML = `<span class="ds-xmark">✕</span> <b>Can't reach the VMS.</b> <span class="muted">Nothing was checked - the last result is kept.</span>`;
+      bar.classList.add("bad");
+    } else if (result.ok) {
+      nowBox.innerHTML = `<svg class="ds-check vf-check" viewBox="0 0 52 52" aria-hidden="true"><circle cx="26" cy="26" r="24"/><path d="M15 27 l8 8 l15 -17"/></svg>
+        <b>All ${result.total} object${result.total === 1 ? "" : "s"} present on the VMS.</b>`;
+      bar.classList.add("good");
+    } else {
+      const miss = result.total - result.present;
+      nowBox.innerHTML = `<span class="ds-xmark">✕</span> <b>${miss} of ${result.total} object${result.total === 1 ? "" : "s"} not found or not readable.</b>
+        <span class="muted">Red rows show what failed.</span>`;
+      bar.classList.add("bad");
+      list.querySelector(".ds-row.failed")?.scrollIntoView({ block: "nearest" });
+    }
+    acts.innerHTML = `<button class="btn ghost" data-a="again">↻ Verify again</button><button class="btn primary" data-a="close">Close</button>`;
+    acts.onclick = (e) => {
+      const a = e.target.closest("[data-a]")?.dataset.a;
+      if (a === "close") close();
+      if (a === "again") run();
+    };
+    acts.querySelector('[data-a="close"]').focus();
+  }
+  run();
+}
+
 /* 🗒 Delete log: every site deletion step, kept in sites/.delete-log.jsonl (outside the deleted folders) */
 const DL_TEXT = {
   delete_site_started: (e) => `Delete site started${e.tenants?.length ? ` - tenant ${e.tenants.join(", ")}` : " - no tenant"}${e.force?.length ? " (force)" : ""}`,
-  delete_object: (e) => `${e.result === "failed" ? "Failed to delete" : e.result === "skipped" ? "Skipped" : "Deleted"} ${dsLow(DS_ORDER.find(([k]) => k === e.kind)?.[1] || e.kind)} “${e.name}”${e.msg ? ` - ${e.msg}` : ""}`,
+  delete_object: (e) => `${e.result === "failed" ? "Failed to delete" : e.result === "skipped" ? "Skipped" : e.result === "deferred" ? "Deferred until after the tenant:" : "Deleted"} ${dsLow(DS_ORDER.find(([k]) => k === e.kind)?.[1] || e.kind)} “${e.name}”${e.msg ? ` - ${e.msg}` : ""}`,
   force_delete_tenant_requested: (e) => `Force delete of tenant “${e.tenant}” confirmed by typing “${e.typed}”`,
   force_delete_tenant: (e) => `${e.result === "failed" ? "Force delete FAILED for" : "FORCE DELETED"} tenant “${e.name}” (id ${e.id})${e.msg ? ` - ${e.msg}` : ""}`,
   tenant_not_on_vms: (e) => `Tenant “${e.tenant}” not on the VMS - nothing to delete there`,
@@ -2601,6 +3033,108 @@ async function startApp() {
   showTab(restored && last && $(`.tab[data-tab="${last}"]`) ? last : d.tenants.some((t) => !tGone(t)) ? "t4" : "t1");
 }
 
+/* ---------------- version (top bar) ---------------- */
+async function showVersion() {
+  const el = $("#appVer");
+  try {
+    const v = await (await fetch("/api/version", { cache: "no-store" })).json();
+    if (!v.running) { el.hidden = true; return; }
+    el.textContent = `v${v.running}`;
+    const stale = v.on_disk && v.on_disk !== v.running;
+    el.classList.toggle("stale", stale);
+    el.title = stale ? `Running v${v.running}. v${v.on_disk} is installed - click to restart the app and load it.`
+                     : `Running version ${v.running}`;
+    if (stale) el.textContent += ` → v${v.on_disk} (restart)`;
+    el.hidden = false;
+  } catch { el.hidden = true; }
+}
+
+/* ---------------- 🔄 Restart app: confirm → restart the server → count down 5 s → reload the page ---------------- */
+async function restartModal() {
+  let info;
+  try { info = await (await fetch("/api/restart", { cache: "no-store" })).json(); }
+  catch (e) { return toast(`Can't reach the app: ${e.message}`); }
+  if (!Array.isArray(info?.blockers)) return toast("This running copy of the app is older than the Restart button - restart it once from the terminal (stop, then run again).");
+  const wrap = document.createElement("div");
+  wrap.className = "modal-backdrop ds-backdrop";
+  wrap.innerHTML = `<div class="modal ds-modal rs-modal" role="dialog" aria-modal="true" aria-labelledby="rsTitle">
+    <div class="ds-head"><h3 id="rsTitle">🔄 Restart the app</h3>
+      <button class="btn ghost sm ds-x" title="Close (Esc)" aria-label="Close">✕</button></div>
+    <div class="ds-body" aria-live="polite"></div>
+    <div class="btn-row modal-actions ds-actions"></div></div>`;
+  const body = wrap.querySelector(".ds-body"), acts = wrap.querySelector(".ds-actions");
+  let locked = false;
+  const close = () => { if (locked) return; wrap.remove(); document.removeEventListener("keydown", onKey); };
+  const onKey = (e) => { if (e.key === "Escape") close(); };
+  wrap.addEventListener("mousedown", (e) => { if (e.target === wrap) close(); });
+  wrap.querySelector(".ds-x").onclick = close;
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(wrap);
+
+  const open = (info.consoles || []).filter((c) => c.status === "connected");
+  const newer = info.on_disk && info.on_disk !== info.version;
+  body.innerHTML = `
+    <p>The app stops and starts again${newer ? `, loading <b>v${esc(info.on_disk)}</b> (now running v${esc(info.version)})` : ` (v${esc(info.version)})`},
+      then this page reloads by itself.</p>
+    <ul class="rs-list small">
+      <li>${info.site ? `Test site <b>${esc(info.site)}</b> opens again.` : "No test site is open."}</li>
+      <li>${open.length ? `<b class="warnc">${open.length} SSH console${open.length === 1 ? "" : "s"} will be disconnected:</b> ${open.map((c) => esc(c.name)).join(", ")} - reconnect them after the restart.`
+        : "No SSH consoles are connected."}</li>
+      <li>Saved settings, tenants and test results are not affected.</li>
+    </ul>
+    ${info.blockers.length ? `<div class="err ds-err"><b>Can't restart now:</b> ${info.blockers.map(esc).join("; ")}. Wait for it to finish.</div>` : ""}`;
+  acts.innerHTML = `<button class="btn ghost" data-a="cancel">Cancel</button>
+    <button class="btn primary" data-a="go" ${info.blockers.length ? "disabled" : ""}>🔄 Restart now</button>`;
+  acts.onclick = (e) => {
+    const a = e.target.closest("[data-a]")?.dataset.a;
+    if (a === "cancel") close();
+    if (a === "go" && !e.target.disabled) go();
+  };
+  acts.querySelector('[data-a="go"]').focus();
+
+  async function go() {
+    locked = true;
+    wrap.querySelector(".ds-x").hidden = true;
+    acts.innerHTML = "";
+    try { await api("POST", "/api/restart", {}); }
+    catch (e) {
+      locked = false; wrap.querySelector(".ds-x").hidden = false;
+      body.insertAdjacentHTML("beforeend", `<div class="err ds-err">${esc(e.message)}</div>`);
+      acts.innerHTML = `<button class="btn primary" data-a="cancel">Close</button>`;
+      return;
+    }
+    const N = 5, C = 2 * Math.PI * 44;
+    body.innerHTML = `<div class="rs-count">
+        <svg viewBox="0 0 100 100" aria-hidden="true"><circle class="rs-track" cx="50" cy="50" r="44"/>
+          <circle class="rs-arc" cx="50" cy="50" r="44" style="stroke-dasharray:${C};stroke-dashoffset:0"/></svg>
+        <span class="rs-num">${N}</span></div>
+      <p class="rs-msg"><b>Restarting the app…</b><br><span class="small muted">This page reloads in <span class="rs-sec">${N}</span> s.</span></p>`;
+    const num = body.querySelector(".rs-num"), sec = body.querySelector(".rs-sec"), arc = body.querySelector(".rs-arc"), msg = body.querySelector(".rs-msg");
+    arc.getBoundingClientRect();   // commit the full ring before the transition starts
+    arc.style.transition = `stroke-dashoffset ${N}s linear`; arc.style.strokeDashoffset = C;
+    for (let n = N - 1; n >= 0; n--) {
+      await dsSleep(1000);
+      num.textContent = n; sec.textContent = n;
+      num.classList.remove("tick"); void num.offsetWidth; num.classList.add("tick");
+    }
+    // wait until the new server answers (normally it already does)
+    msg.innerHTML = `<b>Waiting for the app to come back…</b>`;
+    const until = Date.now() + 30000;
+    while (Date.now() < until) {
+      try { const r = await fetch("/api/version", { cache: "no-store" }); if (r.ok) { msg.innerHTML = "<b>Reloading…</b>"; location.reload(); return; } } catch {}
+      await dsSleep(700);
+    }
+    msg.innerHTML = `<span class="err"><b>The app did not come back within 30 s.</b></span><br>
+      <span class="small muted">Start it again with run.sh / run.command / run.bat, then reload this page.</span>`;
+    locked = false; wrap.querySelector(".ds-x").hidden = false;
+    acts.innerHTML = `<button class="btn primary" data-a="reload">↻ Reload page</button>`;
+    acts.onclick = () => location.reload();
+  }
+}
+$("#restartBtn").onclick = restartModal;
+$("#appVer").addEventListener("click", () => { if ($("#appVer").classList.contains("stale")) restartModal(); });
+
 /* ---------------- start ---------------- */
 applyTheme();
+showVersion();
 fetch("/api/sites").then((r) => r.json()).then((d) => (d.current ? startApp() : showSites()));

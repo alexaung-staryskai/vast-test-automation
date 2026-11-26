@@ -16,7 +16,7 @@
     <div class="brand">
       <span class="logo">▲</span>
       <div>
-        <div class="title">VAST Test Bench</div>
+        <div class="title">VAST Test Bench <span class="ver" id="appVer" hidden></span></div>
         <div class="sub" id="cfgPath">choose a test site</div>
       </div>
     </div>
@@ -34,6 +34,7 @@
       <button class="btn site-btn" id="siteBtn" title="Switch or create a test site">📁 <span id="siteName">no site</span></button>
       <button class="btn ghost" id="themeBtn" title="Switch theme">◐ Auto</button>
       <button class="btn ghost" id="reloadCfg" title="Re-read the config file">↻ Reload</button>
+      <button class="btn ghost" id="restartBtn" title="Restart the app (loads new code) and reload this page">🔄 Restart app</button>
     </div>
   </header>
 
@@ -95,10 +96,10 @@
             <option value="basic">Username / password (basic)</option>
           </select></label>
         <label class="f-field auth-token">Auth token
-          <span class="pw"><input name="api_token" type="password" placeholder="token or ${env:VMS_API_TOKEN}" autocomplete="new-password"><button type="button" class="btn sm ghost eye" title="Show / hide">👁</button></span></label>
+          <span class="pw"><input name="api_token" type="text" class="masked" autocomplete="off" spellcheck="false" autocapitalize="off" data-lpignore="true" data-1p-ignore placeholder="token or ${env:VMS_API_TOKEN}"><button type="button" class="btn sm ghost eye" title="Show / hide">👁</button></span></label>
         <label class="f-field auth-user">Username<input name="username" type="text" autocomplete="off"></label>
         <label class="f-field auth-user">Password
-          <span class="pw"><input name="password" type="password" autocomplete="new-password"><button type="button" class="btn sm ghost eye" title="Show / hide">👁</button></span></label>
+          <span class="pw"><input name="password" type="text" class="masked" autocomplete="off" spellcheck="false" autocapitalize="off" data-lpignore="true" data-1p-ignore><button type="button" class="btn sm ghost eye" title="Show / hide">👁</button></span></label>
         <label class="f-field">Timeout (s)<input name="timeout_seconds" type="number" min="1"></label>
         <label class="f-field check"><input name="verify_ssl" type="checkbox"> Verify SSL certificate</label>
       </form>
@@ -130,6 +131,7 @@
       <div id="vipPick" class="vip-pick">
         <button type="button" class="btn" id="vipOpen">🗺 Choose VIP range…</button>
         <span id="vipChoiceLine" class="small muted"></span>
+        <div id="vipIps" class="vip-ips" hidden></div>
       </div>
       <div id="vipSettingsMsg" class="small"></div>
     </div>
@@ -145,6 +147,15 @@
             <button class="btn primary" id="vipClose">Done</button>
           </div>
         </div>
+        <form id="vipEdit" class="vip-edit" autocomplete="off">
+          <div class="vip-edit-title"><b id="vipEditTitle">VIP pool IP range</b> <span id="vipEditHint" class="small muted"></span></div>
+          <label>Start IP<input name="start" class="mono" spellcheck="false" placeholder="10.20.0.10" required></label>
+          <span class="vip-edit-dash">–</span>
+          <label>End IP<input name="end" class="mono" spellcheck="false" placeholder="10.20.0.14" required></label>
+          <span id="vipEditCount" class="small muted"></span>
+          <button class="btn primary" type="submit" id="vipEditGo">Use this range</button>
+          <div id="vipEditMsg" class="small"></div>
+        </form>
         <div id="vipSummary" class="muted small">Reads every VIP pool and compute-cluster IP on the cluster and proposes a free block inside the configured candidate ranges. Click a free IP to start the block there.</div>
         <div id="vipMap"></div>
       </div>
@@ -203,7 +214,7 @@
         <input name="host" placeholder="host / IP" required>
         <input name="port" placeholder="22" size="5">
         <input name="username" placeholder="user (default from config)">
-        <input name="password" type="password" placeholder="password (default from config)" autocomplete="new-password">
+        <input name="password" type="text" class="masked" autocomplete="off" spellcheck="false" autocapitalize="off" data-lpignore="true" data-1p-ignore placeholder="password (default from config)">
         <label class="save-client" title="Adds it to clients: in this site's config.yaml. A password goes to a hidden file (.client-secrets.json, mode 600), never into config.yaml or the site zip.">
           <input name="save" type="checkbox" checked> 💾 Save to client list</label>
         <button class="btn primary" type="submit">Connect</button>
@@ -250,6 +261,7 @@
             <option value="MB">MB/s</option><option value="GB">GB/s</option><option value="TB">TB/s</option>
           </select>
           <button class="btn" id="perfCsv" title="Download this run's results as CSV, in the chosen unit">⤓ CSV</button>
+          <button class="btn primary" id="perfReport" title="Build a PowerPoint performance report from the runs you pick; it is saved in 🗒 Logs">📊 PowerPoint report</button>
           <button class="btn ghost" id="refreshResults">↻ Refresh</button>
         </div>
       </div>
@@ -303,6 +315,7 @@
         <div><h2>Logs</h2><div class="muted small" id="logsInfo"></div></div>
         <div class="btn-row">
           <button class="btn ghost" id="logsRefresh">↻ Refresh</button>
+          <button class="btn" id="logsReport" title="Build a PowerPoint performance report from the site's performance runs">📊 Performance report</button>
           <button class="btn" id="logsArchive" title="Zip the logs into results/archive/ and remove them from this list">🗄 Archive logs</button>
           <button class="btn danger" id="logsPurge" title="Delete the logs permanently">🗑 Purge logs</button>
         </div>

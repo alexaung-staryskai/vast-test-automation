@@ -63,6 +63,8 @@ def validate(data: Any) -> list[str]:
             if not isinstance(r, dict) or not r.get("start") or not r.get("end"):
                 errors.append("Each vip_pool.ranges entry needs start and end")
                 break
+        from .config import vip_range_problems
+        errors += vip_range_problems(vip)
     return errors
 
 

@@ -31,7 +31,10 @@ h3 { font-size: 13px; margin: 16px 0 6px; color: var(--muted); text-transform: u
 .topbar { position: sticky; top: 0; z-index: 10; display: flex; gap: 16px; align-items: center; padding: 10px 20px; background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
 .brand { display: flex; gap: 10px; align-items: center; margin-right: auto; }
 .logo { font-size: 22px; color: var(--accent); }
-.title { font-weight: 700; }
+.title { font-weight: 700; display: flex; align-items: center; gap: 8px; }
+.ver { font-size: 11px; font-weight: 600; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 1px 7px; cursor: default; }
+.ver.stale { color: var(--warn); border-color: var(--warn); cursor: pointer; }
+.ver.stale:hover { background: color-mix(in srgb, var(--warn) 12%, transparent); }
 .sub { font-size: 12px; color: var(--muted); }
 .tabs { display: flex; gap: 4px; background: var(--bg); padding: 4px; border-radius: 10px; }
 .tab { border: 0; background: transparent; color: var(--muted); padding: 7px 14px; border-radius: 7px; cursor: pointer; font: inherit; font-weight: 600; }
@@ -662,6 +665,7 @@ tr.step-queued td { opacity: .6; }
 .ds-items li.done .ds-iname { text-decoration: line-through; }
 .ds-items li.done .ds-ic::before { content: "✓"; color: var(--ok); font-weight: 700; display: inline-block; animation: dsPop .3s cubic-bezier(.3,1.6,.5,1); }
 .ds-items li.skipped .ds-ic::before { content: "–"; }
+.ds-leftnote { margin: -4px 0 8px; }
 .ds-items li.failed { color: var(--bad); }
 .ds-items li.failed .ds-ic::before { content: "✕"; color: var(--bad); font-weight: 700; }
 .ds-imsg { color: var(--muted); } .ds-items li.failed .ds-imsg { color: var(--bad); }
@@ -696,6 +700,21 @@ tr.step-queued td { opacity: .6; }
   .ds-modal *, .ds-modal *::before, .ds-modal *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
   .ds-check circle, .ds-check path { stroke-dashoffset: 0; }
 }
+/* ✓ Verify on VMS modal: same timeline, calm accent colours instead of the delete red */
+.vf-modal .ds-row.active .ds-dot { border-color: var(--accent); animation: vfPulse 1.1s ease-out infinite; }
+.vf-modal .ds-row.active .ds-dot::after { background: var(--accent); }
+.vf-modal .ds-row.active .ds-rhead b { color: var(--accent); }
+.vf-modal .ds-row.active .ds-state { color: var(--accent); }
+@keyframes vfPulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent); } 100% { box-shadow: 0 0 0 9px transparent; } }
+.vf-modal .ds-spin { border-top-color: var(--accent); }
+.vf-modal .ds-bar i { background: var(--accent); }
+.vf-modal .ds-bar i.good { background: var(--ok); } .vf-modal .ds-bar i.bad { background: var(--bad); }
+.vf-modal .vf-sub { overflow-wrap: anywhere; margin-top: 1px; }
+.vf-modal .ds-row.failed .ds-rhead b { color: var(--bad); }
+.vf-modal .ds-row.vf-skip { opacity: .55; }
+.vf-check { width: 20px; height: 20px; flex: none; }
+.vf-check circle { stroke-width: 4; } .vf-check path { stroke-width: 5; }
+
 /* force delete panel + delete log */
 .ds-force { border: 1px solid var(--bad); border-radius: 8px; padding: 10px 12px; margin: 0 0 12px; background: color-mix(in srgb, var(--bad) 6%, transparent); animation: dsSlide .3s ease both; }
 .ds-force p { margin: 4px 0 10px; }
@@ -720,3 +739,64 @@ tr.step-queued td { opacity: .6; }
 .subtab.active { color: var(--text); border-bottom-color: var(--accent); }
 .subtab-n { font-size: 11.5px; font-weight: 700; padding: 0 7px; border-radius: 999px; background: color-mix(in srgb, var(--muted) 16%, transparent); color: var(--muted); }
 .subtab.active .subtab-n { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
+
+/* ⟳ Restart app modal */
+.rs-modal { width: min(520px, 100%); }
+.rs-list { margin: 6px 0 4px; padding-left: 18px; } .rs-list li { margin: 3px 0; }
+.warnc { color: var(--warn); }
+.rs-count { position: relative; width: 120px; height: 120px; margin: 8px auto 6px; }
+.rs-count svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+.rs-track { fill: none; stroke: var(--border); stroke-width: 6; }
+.rs-arc { fill: none; stroke: var(--accent); stroke-width: 6; stroke-linecap: round; }
+.rs-num { position: absolute; inset: 0; display: grid; place-items: center; font-size: 44px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.rs-num.tick { animation: dsPop .35s cubic-bezier(.3,1.6,.5,1); }
+.rs-msg { text-align: center; margin: 4px 0 6px; }
+@media (prefers-reduced-motion: reduce) { .rs-arc { transition: none !important; } .rs-num.tick { animation: none; } }
+
+/* ✎ Edit client / 🔌 Test connection */
+.ct-modal { width: min(620px, 100%); }
+.ct-form { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 12px; margin: 4px 0 12px; }
+.ct-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--muted); }
+.ct-form input:not([type=checkbox]) { font: inherit; font-size: 13.5px; color: var(--text); padding: 7px 9px; border-radius: 7px; border: 1px solid var(--border); background: var(--bg); }
+.ct-form .ct-check { flex-direction: row; align-items: center; gap: 7px; grid-column: 1 / -1; color: var(--text); }
+.ct-form .ct-note { grid-column: 1 / -1; }
+.ct-test { margin-top: 4px; }
+.vf-modal .ds-row.warn .ds-dot { background: var(--warn); border-color: var(--warn); }
+.vf-modal .ds-row.warn .ds-dot::after { content: "!"; }
+.vf-modal .ds-row.warn .ds-state { color: var(--warn); }
+.vf-modal .ds-row.failed .vf-sub { color: var(--bad); }
+
+/* VIP IPs on the VIP Pool card + typed range in the IP plan window */
+.vip-ips { margin-top: 8px; font-size: 12.5px; }
+.vip-ips-head { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.vip-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.vip-chip { font-size: 11.5px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); background: var(--bg); }
+.vip-edit { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px 10px; margin: 6px 0 12px; padding: 10px 12px;
+  border: 1px solid var(--border); border-radius: 9px; background: color-mix(in srgb, var(--accent) 5%, transparent); }
+.vip-edit-title { flex-basis: 100%; }
+.vip-edit label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+.vip-edit input { font-size: 13.5px; width: 150px; padding: 6px 8px; border-radius: 7px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
+.vip-edit-dash { padding-bottom: 7px; color: var(--muted); }
+#vipEditCount { padding-bottom: 8px; }
+#vipEditMsg { flex-basis: 100%; }
+#vipEditMsg:empty { display: none; }
+
+/* Secrets are masked text fields instead of type="password", so the browser's password manager never treats them as
+   website logins (no "password found in a data breach" pop-ups, no offers to save the VMS password). */
+input.masked:not(.shown) { -webkit-text-security: disc; text-security: disc; }
+input.masked:placeholder-shown { -webkit-text-security: none; text-security: none; }
+
+/* 📊 PowerPoint performance report */
+.pr-modal { width: min(640px, 100%); }
+.pr-tools { display: flex; gap: 18px; align-items: center; margin: 8px 0; }
+.pr-tools select { margin: 0 4px; }
+.pr-runs { max-height: 40vh; overflow: auto; border: 1px solid var(--border); border-radius: 8px; padding: 4px 0; }
+.pr-run { display: flex; gap: 9px; align-items: flex-start; padding: 6px 10px; cursor: pointer; }
+.pr-run:hover { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+.pr-run input { margin-top: 3px; }
+.pr-out { margin-top: 12px; }
+.pr-done { display: flex; gap: 10px; align-items: center; }
+.pr-done .vf-check { width: 28px; height: 28px; }
+.lv-pptx { display: flex; gap: 16px; align-items: center; padding: 28px 20px; }
+.lv-pptx-icon { font-size: 44px; }
+.lv-pptx .btn { margin: 10px 0 6px; display: inline-block; }

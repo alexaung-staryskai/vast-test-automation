@@ -78,8 +78,84 @@ class State:
         return self.tenants.upsert(rec)
 
 
+VERSION_FILE = ROOT / "VERSION"
+
+
+def _read_version() -> str:
+    try:
+        return VERSION_FILE.read_text().strip() or "0.0.0"
+    except OSError:
+        return "0.0.0"
+
+
+APP_VERSION = _read_version()   # the version this server process is running
+
 state = State()
-app = FastAPI(title="VAST Testing Automation")
+app = FastAPI(title="VAST Testing Automation", version=APP_VERSION)
+
+
+RESTART_EXIT_CODE = 75   # start.py relaunches the app when it exits with this code (used on Windows)
+
+
+def _restart_blockers() -> list[str]:
+    out = []
+    prov = getattr(state, "provisioner", None)
+    if state.site and prov is not None and getattr(prov, "running_all", False):
+        out.append("Tenant onboarding is running")
+    if any(r.get("status") == "running" for r in state.sessions.runs.values()):
+        out.append("A test run is in progress")
+    if _teardown_busy:
+        out.append("A test site is being deleted")
+    return out
+
+
+@app.get("/api/restart")
+def restart_info() -> dict:
+    """What a restart would interrupt, for the confirm window."""
+    return {"blockers": _restart_blockers(), "version": APP_VERSION, "on_disk": _read_version(),
+            "site": state.site.name if state.site else None,
+            "consoles": [{"name": s.info().get("name"), "status": s.info().get("status")}
+                         for s in state.sessions.sessions.values()]}
+
+
+@app.post("/api/restart")
+async def restart_app() -> dict:
+    """Restart the server process (loads new code and VERSION) and reopen the same test site.
+    POSIX: re-exec in place (same PID, so start.py and the stop scripts keep working).
+    Windows under start.py: exit with RESTART_EXIT_CODE and start.py starts it again."""
+    import asyncio
+    import sys
+    blockers = _restart_blockers()
+    if blockers:
+        raise HTTPException(409, f"{blockers[0]} - wait for it to finish, then restart")
+    if state.site:
+        os.environ["VAST_TEST_SITE"] = str(state.site)
+    else:
+        os.environ.pop("VAST_TEST_SITE", None)
+
+    argv = list(getattr(sys, "orig_argv", None) or [sys.executable, *sys.argv])   # keeps "-m uvicorn"
+
+    def _go() -> None:
+        print("[VAST Test Bench] Restarting ...", flush=True)
+        if os.name == "nt":
+            if os.environ.get("VAST_LAUNCHER") == "start.py":
+                run_dir = ROOT / ".run"
+                run_dir.mkdir(exist_ok=True)
+                (run_dir / f"app-{os.environ.get('VAST_APP_PORT', '')}.site").write_text(os.environ.get("VAST_TEST_SITE", ""))
+                os._exit(RESTART_EXIT_CODE)
+            import subprocess
+            subprocess.Popen(argv, cwd=os.getcwd(), env=os.environ.copy())
+            os._exit(0)
+        os.execv(sys.executable, argv)
+
+    asyncio.get_running_loop().call_later(0.6, _go)   # let this response reach the browser first
+    return {"ok": True, "site": state.site.name if state.site else None}
+
+
+@app.get("/api/version")
+def get_version() -> dict:
+    """running: the code this process loaded. on_disk: VERSION now (differs after a pull until the app restarts)."""
+    return {"running": APP_VERSION, "on_disk": _read_version()}
 
 
 async def _idle_console_reaper() -> None:
@@ -109,7 +185,7 @@ STATIC = ROOT / "static"
 async def require_site(request, call_next):
     """Everything except the test-site endpoints needs an open test site."""
     path = request.url.path
-    if path.startswith("/api/") and not path.startswith("/api/sites") and state.site is None:
+    if path.startswith("/api/") and not path.startswith(("/api/sites", "/api/version", "/api/restart")) and state.site is None:
         return JSONResponse({"detail": "No test site is open", "code": "no_site"}, status_code=409)
     return await call_next(request)
 
@@ -290,7 +366,10 @@ async def teardown_scan(body: TeardownIn) -> dict:
         try:
             tenant = await teardown.find_tenant(client, name)
             if tenant is None:
-                out.append({"name": name, "found": False, "recorded": bool(rec), "groups": [], "notes": []})
+                left = await teardown.orphan_providers(client, name)
+                out.append({"name": name, "found": False, "recorded": bool(rec), "notes": [],
+                            "groups": [{"kind": "local_provider", "label": teardown.LABEL["local_provider"],
+                                        "items": left}] if left else []})
                 continue
             if tenant.get("id") == 1:
                 raise HTTPException(400, "The VMS default tenant can't be deleted")
@@ -339,6 +418,23 @@ async def teardown_run(body: TeardownIn):
                 if tenant is None:
                     log(action="tenant_not_on_vms", tenant=name)
                     yield line({"t": "tenant_gone", "name": name})
+                    leftover = body.plan.get(name, {}).get("local_provider") or []
+                    if leftover:   # the tenant's local provider was left behind by an earlier delete
+                        stopped = False
+                        try:
+                            async for ev in teardown.run_orphans(client, name, leftover):
+                                if ev["t"] == "item" and ev["s"] != "deleting":
+                                    log(action="delete_object", tenant=name, kind=ev["kind"], id=ev["id"],
+                                        name=ev["name"], result=ev["s"], msg=ev.get("msg") or "")
+                                if ev["t"] == "stop":
+                                    log(action="delete_site_stopped", tenant=name, msg=ev["msg"])
+                                yield line({**ev, "tenant": name})
+                                stopped = stopped or ev["t"] == "stop"
+                        except (teardown.TeardownError, httpx.HTTPError) as e:
+                            log(action="delete_site_stopped", tenant=name, msg=f"VMS error: {e}")
+                            yield line({"t": "stop", "msg": f"VMS error: {e}"}); stopped = True
+                        if stopped:
+                            return
                 elif tenant.get("id") == 1:
                     yield line({"t": "stop", "msg": "The VMS default tenant can't be deleted"}); return
                 else:
@@ -814,7 +910,10 @@ async def vms_test(body: VmsIn | None = None) -> dict:
 @app.post("/api/vip/check")
 async def vip_check() -> dict:
     try:
-        return await state.provisioner.vip_check(state.cfg)
+        pool = state.provisioner.outputs.get("vippool")
+        return await state.provisioner.vip_check(state.cfg, map_only=isinstance(pool, dict) and pool.get("id") is not None)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"{type(e).__name__}: {e}")
 
@@ -894,6 +993,101 @@ async def vip_select(body: VipSelectIn) -> dict:
     return res
 
 
+@app.get("/api/vip/current")
+async def vip_current() -> dict:
+    """The VIP IPs for the VIP Pool card: the pool on the VMS once it exists (read live), otherwise the chosen range."""
+    from . import ipam
+    p = state.provisioner
+    vp = state.cfg.get("vip_pool", {})
+    count = max(ipam.MIN_IPS, int(vp.get("ip_count", ipam.MIN_IPS)))
+    out: dict = {"auto": bool(vp.get("auto_select", True)), "count": count, "pool": None, "choice": None}
+    if p.vip_choice:
+        try:
+            a = ipam.ip2int(p.vip_choice)
+            out["choice"] = {"start": p.vip_choice, "end": ipam.int2ip(a + count - 1), "count": count}
+        except ValueError:
+            pass
+    pool = p.outputs.get("vippool") if isinstance(p.outputs.get("vippool"), dict) else None
+    if pool and pool.get("id") is not None:
+        rec = {"id": pool["id"], "name": pool.get("name"), "ip_ranges": pool.get("ip_ranges"), "live": False}
+        try:
+            r = await VMSClient(state.cfg).request("GET", f"/vippools/{pool['id']}/")
+            if r["ok"] and isinstance(r["body"], dict):
+                b = r["body"]
+                rec.update(name=b.get("name", rec["name"]), ip_ranges=b.get("ip_ranges"), live=True,
+                           subnet_cidr=b.get("subnet_cidr"), vlan=b.get("vlan"), state=b.get("state"))
+            elif r["status"] == 404:
+                rec["error"] = "not found on the VMS any more"
+            else:
+                rec["error"] = f"VMS answered HTTP {r['status']}"
+        except Exception as e:  # noqa: BLE001
+            rec["error"] = f"{type(e).__name__}: {e}"
+        rec["ips"] = ipam.expand(rec.get("ip_ranges"))
+        out["pool"] = rec
+    return out
+
+
+class VipRangeIn(BaseModel):
+    start: str
+    end: str
+
+
+@app.post("/api/vip/range")
+async def vip_set_range(body: VipRangeIn) -> dict:
+    """A typed VIP range. Before the VIP pool exists: the range step 1 will use (manual selection, the number of IPs
+    follows the range). Once it exists: change the pool's ip_ranges on the VMS (PATCH /vippools/{id}/)."""
+    from . import ipam
+    try:
+        a, b = ipam.ip2int(body.start), ipam.ip2int(body.end)
+    except ValueError:
+        raise HTTPException(400, "Start and end must be IPv4 addresses, e.g. 10.20.0.10")
+    if b < a:
+        raise HTTPException(400, "The end IP must not be before the start IP")
+    count = b - a + 1
+    if not ipam.MIN_IPS <= count <= 1024:
+        raise HTTPException(400, f"A VIP pool needs {ipam.MIN_IPS} to 1024 IPs - this range has {count}")
+    start, end = ipam.int2ip(a), ipam.int2ip(b)
+    p = state.provisioner
+    pool = p.outputs.get("vippool") if isinstance(p.outputs.get("vippool"), dict) else None
+
+    if pool and pool.get("id") is not None:
+        client = VMSClient(state.cfg)
+        holders, _ = await ipam.list_holders(client)
+        others = [h for h in holders if not (h["kind"] == "VIP pool" and h["name"] == pool.get("name"))]
+        used = ipam.used_map(others)
+        clash = next((n for n in range(a, b + 1) if n in used), None)
+        if clash is not None:
+            raise HTTPException(400, f"{ipam.int2ip(clash)} is already used by {used[clash]} - choose another range")
+        r = await client.request("PATCH", f"/vippools/{pool['id']}/", body={"ip_ranges": [[start, end]]})
+        if not r["ok"]:
+            raise HTTPException(502, f"The VMS refused the change: HTTP {r['status']} {str(r['body'])[:300]}")
+        p.outputs["vippool"] = {**pool, "ip_ranges": [[start, end]]}
+        p.outputs["vip"] = {"start": start, "end": end, "count": count, "ips": ipam.expand([[start, end]])}
+        state.vip_overrides["ip_count"] = count
+        state.cfg["vip_pool"]["ip_count"] = count
+        p._save_state()
+        state.sync_tenant()
+        return {"changed_on_vms": True, **await vip_current()}
+
+    # not created yet: manual selection of exactly this range
+    vp = state.cfg["vip_pool"]
+    prev = (p.vip_choice, vp.get("ip_count"), vp.get("auto_select", True))
+    vp.update(ip_count=count, auto_select=False)
+    state.vip_overrides.update(ip_count=count, auto_select=False)
+    p.vip_choice = start
+    res = await vip_check()
+    got = res.get("proposal")
+    if not got or got["start"] != start:
+        p.vip_choice, vp["ip_count"], vp["auto_select"] = prev
+        state.vip_overrides.update(ip_count=prev[1], auto_select=prev[2])
+        cand = ", ".join(f"{r['start']} – {r['end']}" for r in res.get("candidate_ranges", []))
+        used = next((c["holder"] for c in res.get("cells", []) if a <= ipam.ip2int(c["ip"]) <= b and c.get("holder")), None)
+        why = f"{used} holds part of it" if used else f"it must be free and inside the candidate ranges ({cand})"
+        raise HTTPException(400, f"{start} – {end} can't be used: {why}")
+    p._save_state()
+    return {"changed_on_vms": False, "check": res, **await vip_current()}
+
+
 @app.get("/api/provision/state")
 async def provision_state() -> dict:
     # async on purpose: runs on the event loop, so it never reads a result while a step is mutating it
@@ -967,6 +1161,67 @@ async def verify_tenant(body: TenantKeyIn) -> dict:
     ok = bool(checks) and all(v == "present" for v in checks.values())
     return state.tenants.update(body.key, verified_at=results_now(), verify=checks,
                                 verify_ok=ok) or {}
+
+
+@app.post("/api/tenants/verify/stream")
+async def verify_tenant_stream(body: TenantKeyIn):
+    """Same check as /api/tenants/verify, streamed as NDJSON so the UI can show each step as it happens:
+    connect → one GET per recorded object → saved."""
+    import time
+    from fastapi.responses import StreamingResponse
+    rec = next((t for t in state.tenants.load() if TenantStore.key(t) == body.key), None)
+    if not rec:
+        raise HTTPException(404, "Unknown tenant")
+    vms_url = str(state.cfg["vms"].get("url", "")).rstrip("/")
+    if rec.get("vms") != vms_url:
+        raise HTTPException(400, f"This tenant is on {rec.get('vms')}, but the app is connected to {vms_url}")
+    objects = [o for o in rec.get("objects") or [] if o.get("endpoint")]
+
+    async def gen():
+        def line(d: dict) -> bytes:
+            return (json.dumps(d) + "\n").encode()
+        client = VMSClient(state.cfg)
+        yield line({"t": "start", "vms": vms_url, "objects": [{"step": o["step"], "name": o.get("name", o["step"]),
+                                                               "endpoint": o["endpoint"]} for o in objects]})
+        # 1. can we reach the VMS at all?
+        yield line({"t": "connect", "s": "checking"})
+        t0 = time.monotonic()
+        try:
+            r = await client.request("GET", state.cfg["vms"].get("health_endpoint", "/clusters/"))
+            ok = r["ok"]
+            info = r["body"]
+            items = info.get("results") if isinstance(info, dict) and "results" in info else info
+            c = items[0] if isinstance(items, list) and items and isinstance(items[0], dict) else {}
+            detail = " · ".join(str(x) for x in (c.get("name"), c.get("sw_version")) if x) if ok else f"HTTP {r['status']}"
+        except Exception as e:  # noqa: BLE001
+            ok, detail = False, f"{type(e).__name__}: {e}"
+        yield line({"t": "connect", "s": "ok" if ok else "failed", "detail": detail,
+                    "ms": round((time.monotonic() - t0) * 1000)})
+        if not ok:
+            yield line({"t": "done", "ok": False, "connect_failed": True})
+            return
+        # 2. every object onboarding created
+        checks = {}
+        for o in objects:
+            yield line({"t": "check", "step": o["step"], "s": "checking"})
+            t0 = time.monotonic()
+            found = None
+            try:
+                r = await client.request("GET", o["endpoint"])
+                res = "present" if r["ok"] else ("missing" if r["status"] == 404 else f"HTTP {r['status']}")
+                if r["ok"] and isinstance(r["body"], dict):
+                    b = r["body"]
+                    found = {k: b.get(k) for k in ("id", "name", "username", "path", "state") if b.get(k) not in (None, "")}
+            except Exception as e:  # noqa: BLE001
+                res = f"error: {type(e).__name__}"
+            checks[o["step"]] = res
+            yield line({"t": "check", "step": o["step"], "s": res, "found": found,
+                        "ms": round((time.monotonic() - t0) * 1000)})
+        ok = bool(checks) and all(v == "present" for v in checks.values())
+        state.tenants.update(body.key, verified_at=results_now(), verify=checks, verify_ok=ok)
+        yield line({"t": "done", "ok": ok, "present": sum(v == "present" for v in checks.values()), "total": len(checks)})
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
 def _tenant_on_this_vms(key: str) -> dict:
@@ -1148,6 +1403,188 @@ def delete_client(name: str) -> dict:
         _write_client_secrets(secrets)
     state.cfg["clients"] = [c for c in state.cfg["clients"] if c["name"] != name]
     return {"ok": True, "clients": get_config()["clients"]}
+
+
+class ClientEditIn(BaseModel):
+    name: str = ""
+    host: str = ""
+    port: str | int | None = None
+    username: str = ""
+    password: str = ""                 # empty = keep the saved one
+    clear_password: bool = False       # forget the saved password (use the ssh: default)
+
+
+@app.put("/api/clients/{old_name}")
+def edit_client(old_name: str, body: ClientEditIn) -> dict:
+    """Change a saved client (name, host, port, user, password). Open consoles keep their current connection."""
+    ssh = state.cfg["ssh"]
+    data = config_store.read_raw(config_path())["data"]
+    clients = data.get("clients") or []
+    idx = next((i for i, c in enumerate(clients) if c.get("name") == old_name), None)
+    if idx is None:
+        raise HTTPException(404, f"No saved client named {old_name}")
+    host = body.host.strip()
+    if not host:
+        raise HTTPException(400, "Host is required")
+    name = body.name.strip() or host
+    if name != old_name and any(c.get("name") == name for c in clients):
+        raise HTTPException(400, f"Another saved client is already called “{name}”")
+    entry = {k: v for k, v in clients[idx].items() if k not in ("name", "host", "port", "username")}
+    entry = {"name": name, "host": host, **entry}
+    port = str(body.port or "").strip()
+    if port and int(_int_field(port, "Port", 1, 65535)) != int(ssh.get("port", 22)):
+        entry["port"] = int(port)
+    user = body.username.strip()
+    if user and user != ssh.get("username"):
+        entry["username"] = user
+    if body.clear_password:
+        entry.pop("password", None)
+    clients[idx] = entry
+    data["clients"] = clients
+    res = config_store.save_data(config_path(), data)
+    if not res["ok"]:
+        raise HTTPException(400, {"errors": res["errors"]})
+    secrets = _client_secrets()
+    old_secret = secrets.pop(old_name, None)
+    if body.password:
+        secrets[name] = body.password
+    elif old_secret is not None and not body.clear_password:
+        secrets[name] = old_secret
+    _write_client_secrets(secrets)
+    live = list(state.cfg["clients"])
+    li = next((i for i, c in enumerate(live) if c["name"] == old_name), None)
+    if li is None:
+        live.append(dict(entry))
+    else:
+        live[li] = dict(entry)
+    state.cfg["clients"] = live
+    return {"client": entry, "clients": get_config()["clients"]}
+
+
+class ClientTestIn(ClientEditIn):
+    saved: str = ""                    # start from this saved client; the fields above override it
+
+
+def _effective_client(body: ClientTestIn) -> dict:
+    ssh = state.cfg["ssh"]
+    base = next((c for c in state.cfg["clients"] if c["name"] == body.saved), None) if body.saved else None
+    if body.saved and base is None:
+        raise HTTPException(404, f"No saved client named {body.saved}")
+    base = dict(base or {})
+    host = body.host.strip() or base.get("host", "")
+    if not host:
+        raise HTTPException(400, "Host is required")
+    port = str(body.port or "").strip() or base.get("port") or ssh.get("port", 22)
+    if body.password:
+        pw, src = body.password, "typed"
+    elif not body.clear_password and body.saved and body.saved in _client_secrets():
+        pw, src = _client_secrets()[body.saved], "saved"
+    elif not body.clear_password and base.get("password"):
+        pw, src = base["password"], "config"
+    else:
+        pw, src = ssh.get("password", ""), "config"
+    return {"host": host, "port": int(_int_field(str(port), "Port", 1, 65535)),
+            "username": body.username.strip() or base.get("username") or ssh.get("username", "root"),
+            "password": pw or "", "password_source": src if pw else "keys"}
+
+
+@app.post("/api/clients/test")
+async def test_client(body: ClientTestIn):
+    """Check a client step by step (NDJSON): name lookup → TCP port + SSH banner → login → a command → sudo.
+    Uses the same SSH options as the consoles. Nothing is changed on the client."""
+    import asyncio
+    import socket
+    import time
+    import asyncssh
+    from fastapi.responses import StreamingResponse
+    cl = _effective_client(body)
+    timeout = float(state.cfg["ssh"].get("connect_timeout_seconds", 15))
+
+    def line(d: dict) -> bytes:
+        return (json.dumps(d) + "\n").encode()
+
+    def why(e: BaseException) -> str:
+        if isinstance(e, asyncio.TimeoutError):
+            return f"no answer within {timeout:g} s - host down, firewall, or VPN not connected?"
+        if isinstance(e, socket.gaierror):
+            return "host name not found (DNS)"
+        if isinstance(e, ConnectionRefusedError):
+            return f"connection refused - nothing is listening on port {cl['port']}"
+        if isinstance(e, asyncssh.PermissionDenied):
+            return "login refused - wrong username or password" if cl["password"] else \
+                ("login refused - this client has no password (none saved, and the config's ssh password is empty) and "
+                 "no SSH key was accepted. Use ✎ Edit to enter the password, then test again")
+        return f"{type(e).__name__}: {e}"
+
+    async def gen():
+        ms = lambda t0: round((time.monotonic() - t0) * 1000)  # noqa: E731
+        yield line({"t": "start", "host": cl["host"], "port": cl["port"], "username": cl["username"],
+                    "auth": cl["password_source"]})
+        # 1. name lookup
+        yield line({"t": "step", "id": "dns", "s": "running"}); t0 = time.monotonic()
+        try:
+            infos = await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(
+                cl["host"], cl["port"], type=socket.SOCK_STREAM), timeout)
+            ips = list(dict.fromkeys(i[4][0] for i in infos))
+            yield line({"t": "step", "id": "dns", "s": "ok", "ms": ms(t0), "detail": ", ".join(ips[:4])})
+        except Exception as e:  # noqa: BLE001
+            yield line({"t": "step", "id": "dns", "s": "failed", "detail": why(e)}); yield line({"t": "done", "ok": False}); return
+        # 2. TCP port + SSH banner
+        yield line({"t": "step", "id": "tcp", "s": "running"}); t0 = time.monotonic()
+        try:
+            r, w = await asyncio.wait_for(asyncio.open_connection(cl["host"], cl["port"]), timeout)
+            try:
+                banner = (await asyncio.wait_for(r.readline(), 5)).decode(errors="replace").strip()
+            except asyncio.TimeoutError:
+                banner = ""
+            w.close()
+            if banner and not banner.startswith("SSH-"):
+                yield line({"t": "step", "id": "tcp", "s": "failed", "ms": ms(t0),
+                            "detail": f"port {cl['port']} is open but it is not SSH: {banner[:80]}"})
+                yield line({"t": "done", "ok": False}); return
+            yield line({"t": "step", "id": "tcp", "s": "ok", "ms": ms(t0),
+                        "detail": f"port {cl['port']} open" + (f" · {banner[:80]}" if banner else "")})
+        except Exception as e:  # noqa: BLE001
+            yield line({"t": "step", "id": "tcp", "s": "failed", "detail": why(e)}); yield line({"t": "done", "ok": False}); return
+        # 3. SSH login (same options as the consoles)
+        yield line({"t": "step", "id": "auth", "s": "running"}); t0 = time.monotonic()
+        try:
+            conn = await asyncio.wait_for(asyncssh.connect(
+                cl["host"], port=cl["port"], username=cl["username"], password=cl["password"] or None,
+                known_hosts=None, **({"client_keys": (), "agent_path": None} if cl["password"] else {})), timeout)
+            yield line({"t": "step", "id": "auth", "s": "ok", "ms": ms(t0),
+                        "detail": f"logged in as {cl['username']} with " +
+                                  ("an SSH key" if not cl["password"] else "the password")})
+        except Exception as e:  # noqa: BLE001
+            yield line({"t": "step", "id": "auth", "s": "failed", "detail": why(e)}); yield line({"t": "done", "ok": False}); return
+        try:
+            # 4. a harmless command
+            yield line({"t": "step", "id": "cmd", "s": "running"}); t0 = time.monotonic()
+            try:
+                res = await asyncio.wait_for(conn.run(
+                    'hostname; uname -sr; (. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME") || echo', check=False), 20)
+                out = [x.strip() for x in str(res.stdout or "").splitlines()]
+                detail = " · ".join(x for x in out if x) or "(no output)"
+                yield line({"t": "step", "id": "cmd", "s": "ok" if res.exit_status == 0 else "failed", "ms": ms(t0),
+                            "detail": detail if res.exit_status == 0 else f"exit {res.exit_status}: {str(res.stderr)[:120]}"})
+            except Exception as e:  # noqa: BLE001
+                yield line({"t": "step", "id": "cmd", "s": "failed", "detail": why(e)}); yield line({"t": "done", "ok": False}); return
+            # 5. sudo (presets such as mount and package install need it) - a warning only
+            yield line({"t": "step", "id": "sudo", "s": "running"}); t0 = time.monotonic()
+            try:
+                r1 = await asyncio.wait_for(conn.run("sudo -n true", check=False), 15)
+                if r1.exit_status == 0:
+                    yield line({"t": "step", "id": "sudo", "s": "ok", "ms": ms(t0), "detail": "sudo works without a password prompt"})
+                else:
+                    yield line({"t": "step", "id": "sudo", "s": "warn", "ms": ms(t0),
+                                "detail": "sudo asks for a password - presets that use sudo will prompt in the console"})
+            except Exception as e:  # noqa: BLE001
+                yield line({"t": "step", "id": "sudo", "s": "warn", "detail": why(e)})
+        finally:
+            conn.close()
+        yield line({"t": "done", "ok": True})
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
 @app.post("/api/sessions")
@@ -1429,6 +1866,52 @@ def download_archive(name: str) -> FileResponse:
     if p.parent != adir or not p.is_file() or not name.startswith("logs-") or not name.endswith(".zip"):
         raise HTTPException(404, "Not found")
     return FileResponse(p, filename=p.name, media_type="application/zip")
+
+
+class PerfReportIn(BaseModel):
+    runs: list[str] = []      # run ids (results/<id>.json); empty = every performance run of the site
+    unit: str = "GB"
+
+
+@app.post("/api/reports/performance")
+def performance_report(body: PerfReportIn) -> dict:
+    """Build a PowerPoint performance report from elbencho runs; it lands in the results folder / 🗒 Logs tab."""
+    import re
+    from . import perf_report
+    perf = [e for e in results.list_logs(_perf_groups()) if e["performance"] and e["type"] != "report"
+            and any(f["name"].endswith(".json") for f in e["files"])]
+    ids = body.runs or [e["id"] for e in perf]
+    known = {e["id"] for e in perf}
+    bad = [i for i in ids if i not in known]
+    if bad:
+        raise HTTPException(400, f"Not a performance run of this site: {', '.join(bad[:3])}")
+    if not ids:
+        raise HTTPException(400, "No performance runs yet - run Elbencho Write / Read in tab ② first")
+    runs = []
+    for i in ids:
+        try:
+            runs.append(json.loads((results.RESULTS_DIR / f"{i}.json").read_text()))
+        except (OSError, ValueError) as e:
+            raise HTTPException(400, f"Can't read {i}.json: {e}")
+    tenant = dict(runs[-1].get("vars") or {})
+    tenant.update({k: v for k, v in (state.vars or {}).items() if k in ("tenant_name", "view_path") and v and not tenant.get(k)})
+    mount = dict(state.cfg.get("mount") or {})
+    ips = state.provisioner.vip_ips() if state.provisioner else []
+    if not ips:
+        rec = next((t for t in reversed(state.tenants.load()) if t.get("name") == tenant.get("tenant_name")), None) if state.tenants else None
+        ips = list(((rec or {}).get("vip_pool") or {}).get("ips") or [])
+    if mount.get("options") and ips:   # show the real VIPs instead of ${tenant_vip.start}-${tenant_vip.end}
+        mount["options"] = re.sub(r"\$\{tenant_vip\.start\}", ips[0], re.sub(r"\$\{tenant_vip\.end\}", ips[-1], str(mount["options"])))
+    clients = [{"name": c["name"], "host": c["host"], "username": c.get("username", state.cfg["ssh"].get("username"))}
+               for c in state.cfg.get("clients", [])]
+    out = perf_report.report_path(results.RESULTS_DIR)
+    try:
+        res = perf_report.build(runs, out, site=sites.info(state.site)["name"] if state.site else "Test site",
+                                unit=body.unit.upper(), vms=str(state.cfg["vms"].get("url", "")).rstrip("/"),
+                                tenant=tenant, clients=clients, mount=mount, version=APP_VERSION)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {**res, "log_id": out.stem}
 
 
 @app.get("/api/results")

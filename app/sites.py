@@ -107,6 +107,8 @@ def info(path: Path) -> dict:
              "vip_range": (t.get("vip_pool") or {}).get("range"),
              "objects": [o.get("step") for o in t.get("objects") or [] if isinstance(o, dict)]}
             for t in tenants if isinstance(t, dict) and t.get("status") not in GONE],
+        # tenants already deleted from the VMS - "Check VMS for leftovers" looks for what the VMS left behind
+        "deleted_tenants": [t.get("name") for t in tenants if isinstance(t, dict) and t.get("status") in GONE and t.get("name")],
         "results": len(results),
         "backups": len(list((path / "config-backups").glob("*.yaml"))) if (path / "config-backups").is_dir() else 0,
         "copied_from": meta.get("copied_from"),
