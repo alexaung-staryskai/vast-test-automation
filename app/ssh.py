@@ -418,10 +418,27 @@ class SessionManager:
             except Exception:
                 s.sudo_nopasswd = False
         await s.emit(f"\r\n{CYAN}━━ {run['label']} ({len(cmds)} command{'s' if len(cmds) != 1 else ''}) ━━{RESET}\r\n")
+        after_wait = False
         for idx, item in enumerate(cmds, 1):
+            if isinstance(item, dict) and "wait" in item:
+                # an idle step (e.g. elbencho.idle_before_read_seconds): the app waits, nothing runs on the client
+                try:
+                    secs = max(0.0, float(render(item["wait"], ctx) or 0))
+                except (TemplateError, TypeError, ValueError) as e:
+                    msg = f"idle step: {e}" if isinstance(e, TemplateError) else f"idle step: '{item['wait']}' is not a number of seconds"
+                    rec["commands"].append({"command": f"idle {item['wait']}", "exit_code": None, "error": msg, "output": ""})
+                    rec["status"] = "failed"
+                    await s.emit(f"{RED}✖ {msg}{RESET}\r\n")
+                    break
+                if secs:
+                    rec["commands"].append(await self._idle(run, s, secs, item.get("label") or "idle", idx, len(cmds)))
+                    after_wait = True
+                continue
             tpl = item["run"] if isinstance(item, dict) else item
             display_tpl = item.get("display", tpl) if isinstance(item, dict) else tpl
-            if idx > 1 and st["delay_between_commands_seconds"]:
+            if after_wait:   # the idle step replaces the usual pause between commands
+                after_wait = False
+            elif idx > 1 and st["delay_between_commands_seconds"]:
                 await s.emit(f"{DIM}… waiting {st['delay_between_commands_seconds']}s{RESET}\r\n")
                 await asyncio.sleep(float(st["delay_between_commands_seconds"]))
             try:
@@ -455,6 +472,21 @@ class SessionManager:
                 s.shell.stdin.write("\n")  # redraw the interactive prompt
             except (BrokenPipeError, OSError):
                 pass
+        return rec
+
+    async def _idle(self, run: dict, s: Session, secs: float, label: str, idx: int, total: int) -> dict:
+        """Wait secs seconds with a countdown in the console; recorded in the run log like a command."""
+        await s.emit(f"\r\n{YELLOW}[{run['label']} {idx}/{total}]{RESET} {CYAN}⏸ {label}: idle {secs:g}s{RESET}\r\n")
+        rec: dict[str, Any] = {"command": f"idle {secs:g}s ({label})", "started_at": now_iso(), "output": ""}
+        started = time.monotonic()
+        step = 10.0 if secs > 30 else 5.0
+        while (left := secs - (time.monotonic() - started)) > 0:
+            await asyncio.sleep(min(step, left))
+            left = secs - (time.monotonic() - started)
+            if left > 0.5:
+                await s.emit(f"{DIM}… {left:.0f}s left{RESET}\r\n")
+        rec.update(exit_code=0, duration_s=round(time.monotonic() - started, 2), output=f"idle {secs:g}s")
+        await s.emit(f"{GREEN}  idle done ({rec['duration_s']}s){RESET}\r\n")
         return rec
 
     async def _exec(self, run: dict, s: Session, cmd: str, display: str, idx: int, total: int,

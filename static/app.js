@@ -874,6 +874,19 @@ $("#addConsole").onclick = (e) => {
   busy(e.target, () => openConsole({ client: v }));
 };
 $("#openAll").onclick = (e) => busy(e.target, async () => { for (const c of CFG.clients) await openConsole({ client: c.name }); });
+// Disconnect every live console (the same as each console's ⏏ Disconnect: the console and its output stay)
+$("#disconnectAll").onclick = async (e) => {
+  const live = [...consoles.values()].filter((c) => c.status === "connected" || c.status === "connecting");
+  if (!live.length) return;
+  const names = live.map((c) => c.info?.name || c.id);
+  if (!(await uiConfirm({ title: `Disconnect ${live.length} console${live.length === 1 ? "" : "s"}?`, ok: "Disconnect all",
+    html: `<p>Closes the SSH connection of: ${names.map(esc).join(", ")}.</p><p class="muted small">The consoles and their output stay; use ↻ Reconnect on a console to connect it again.</p>` }))) return;
+  busy(e.target, async () => {
+    const res = await Promise.allSettled(live.map((c) => api("POST", `/api/sessions/${c.id}/disconnect`)));
+    const failed = res.map((r, i) => (r.status === "rejected" ? `${names[i]}: ${r.reason?.message || r.reason}` : null)).filter(Boolean);
+    if (failed.length) alert(`Not disconnected:\n${failed.join("\n")}`);
+  });
+};
 $("#customForm").onsubmit = async (e) => {
   e.preventDefault();
   const form = e.target;
@@ -1140,7 +1153,7 @@ function mountConsole(info, req = null) {
     requestAnimationFrame(() => { fitQueued = false; c.fit(); });
   }).observe($(".term", el));
 
-  $(".sel", el).onchange = (e) => api("PUT", `/api/sessions/${c.id}`, { selected: e.target.checked }).catch(() => {});
+  $(".sel", el).onchange = (e) => { api("PUT", `/api/sessions/${c.id}`, { selected: e.target.checked }).catch(() => {}); renderPackages(); };
   $(".disconnect", el).onclick = (e) => busy(e.target, () => api("POST", `/api/sessions/${c.id}/disconnect`));
   $(".close", el).onclick = () => { api("DELETE", `/api/sessions/${c.id}`).catch(() => {}); removeUi(); };
   $(".retry", el).onclick = (e) => busy(e.target, async () => {
@@ -1236,26 +1249,60 @@ function zoomKey(e) {
 /* ---- packages ---- */
 let pkgStatus = {};
 function renderPackages() {
-  const ids = Object.keys(pkgStatus).filter((id) => consoles.has(id));
+  const ids = Object.keys(pkgStatus).filter((id) => consoles.has(id))
+    .sort((a, b) => String(pkgStatus[a].client).localeCompare(String(pkgStatus[b].client), undefined, { numeric: true }));
   if (!ids.length) return;
   const names = CFG.packages;
-  const head = `<tr><th>Client</th><th>Pkg mgr</th>${names.map((n) => `<th>${esc(n)}</th>`).join("")}</tr>`;
-  const rows = ids.map((id) => {
-    const st = pkgStatus[id];
-    const cells = names.map((n) => {
-      const p = st.packages[n] || {};
-      if (!p.installed) return `<td><span class="pk-miss">✗ missing</span>${p.detail ? `<span class="ver" title="${esc(p.detail)}">${esc(p.detail)}</span>` : ""}</td>`;
-      const upd = p.update_available ? ` <span class="pk-upd" title="update available">⬆</span>` : "";
-      return `<td><span class="pk-ok">✓</span>${upd}<span class="ver" title="${esc(p.version)}">${esc(p.version)}</span></td>`;
-    }).join("");
-    return `<tr><td><b>${esc(st.client)}</b></td><td>${esc(st.pm || "?")}</td>${cells}</tr>`;
-  }).join("");
+  // one row per package, one column per client: stays narrow however many packages the config lists
+  const info = (n) => (CFG.package_info || {})[n] || {};
+  const act = (a, n, sid, label, title) =>
+    `<button class="pk-btn${a === "uninstall" ? " danger" : ""}" data-pact="${a}" data-pkg="${esc(n)}"${sid ? ` data-sid="${esc(sid)}"` : ""} title="${esc(title)}">${label}</button>`;
+  const noUn = (n) => !info(n).uninstall;
+  const cell = (id, n) => {
+    const p = pkgStatus[id].packages[n] || {};
+    const who = pkgStatus[id].client;
+    if (!p.installed) return `<td><span class="pk-miss">✗ missing</span>${p.detail ? `<span class="ver" title="${esc(p.detail)}">${esc(p.detail)}</span>` : ""}
+      <span class="pk-acts">${act("install", n, id, "Install", `Install ${n} on ${who}`)}</span></td>`;
+    const upd = p.update_available ? ` <span class="pk-upd" title="update available">⬆</span>` : "";
+    return `<td><span class="pk-ok">✓</span>${upd}<span class="ver" title="${esc(p.version)}">${esc(p.version)}</span>
+      <span class="pk-acts">${act("reinstall", n, id, "Reinstall", `Reinstall ${n} on ${who}`)}${noUn(n) ? "" : act("uninstall", n, id, "Uninstall", `Uninstall ${n} from ${who}`)}</span></td>`;
+  };
+  // row buttons act on every ticked client the action applies to; shown only when it applies to at least one
+  const ticked = selectedIds().filter((id) => ids.includes(id));
+  const has = (n, inst) => ticked.some((id) => !!pkgStatus[id].packages[n]?.installed === inst);
+  const rowActs = (n) => ticked.length < 2 ? "" : `<span class="pk-acts pk-row">${has(n, false) ? act("install", n, "", "Install on all", `Install ${n} on the ticked clients where it is missing`) : ""}${has(n, true) ? act("reinstall", n, "", "Reinstall on all", `Reinstall ${n} on the ticked clients`) : ""}${has(n, true) && !noUn(n) ? act("uninstall", n, "", "Uninstall from all", `Uninstall ${n} from the ticked clients where it is installed`) : ""}</span>`;
+  const head = `<tr><th>Package</th>${ids.map((id) => `<th><b>${esc(pkgStatus[id].client)}</b> <span class="muted">${esc(pkgStatus[id].pm || "?")}</span></th>`).join("")}</tr>`;
+  const rows = names.map((n) => `<tr><td><b>${esc(n)}</b>${info(n).system ? ` <span class="muted small">system</span>` : ""}${rowActs(n)}</td>${ids.map((id) => cell(id, n)).join("")}</tr>`).join("");
   const missing = ids.reduce((a, id) => a + Object.values(pkgStatus[id].packages).filter((p) => !p.installed).length, 0);
   const upd = ids.reduce((a, id) => a + Object.values(pkgStatus[id].packages).filter((p) => p.update_available).length, 0);
   $("#pkgTable").innerHTML = `<table class="pkgs"><thead>${head}</thead><tbody>${rows}</tbody></table>
     <div class="small muted" style="margin-top:6px">${missing} missing · ${upd} with updates available.
     Packages with a custom <code>install</code> command (e.g. elbencho) are re-installed by <b>Update</b>.</div>`;
 }
+// Install / Reinstall / Uninstall one package: a cell acts on that client, the row's buttons on the ticked clients
+$("#pkgTable").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-pact]");
+  if (!b) return;
+  const { pact: action, pkg } = b.dataset;
+  const applies = (id) => action === "reinstall" || !!pkgStatus[id]?.packages[pkg]?.installed === (action === "uninstall");
+  const ids = b.dataset.sid ? [b.dataset.sid] : selectedIds().filter((id) => pkgStatus[id] && applies(id));
+  if (!ids.length) return alert(`Nothing to ${action} on the ticked clients - run Check packages first`);
+  const who = ids.map((id) => pkgStatus[id]?.client || id).join(", ");
+  if (action !== "install") {
+    const custom = (CFG.package_info || {})[pkg]?.custom;
+    const warn = action === "uninstall"
+      ? (pkg === "vastnfs" ? "<p>The VAST NFS driver is removed; reboot the client to unload it. Unmount VAST first.</p>"
+        : /nfs/.test(pkg) ? "<p>Unmount the VAST view first.</p>" : "")
+      : (custom ? `<p>Runs the configured install command for <b>${esc(pkg)}</b> again${pkg === "vastnfs" ? " (rebuilds the driver: several minutes)" : ""}.</p>` : "");
+    const ok = await uiConfirm({ title: `${action === "uninstall" ? "Uninstall" : "Reinstall"} ${esc(pkg)}?`,
+      ok: action === "uninstall" ? "Uninstall" : "Reinstall", danger: action === "uninstall",
+      html: `<p>${action === "uninstall" ? "Removes" : "Reinstalls"} <b>${esc(pkg)}</b> on: ${esc(who)}.</p>${warn}` });
+    if (!ok) return;
+  }
+  const verb = { install: "Install", reinstall: "Reinstall", uninstall: "Uninstall" }[action];
+  busy(b, () => startRun("/api/packages/action", { session_ids: ids, package: pkg, action }, `${verb} ${pkg}`,
+    () => startRun("/api/packages/check", { session_ids: ids }, "Check packages", loadPkgStatus)));
+});
 async function loadPkgStatus() { pkgStatus = await api("GET", "/api/packages/status").catch(() => ({})); renderPackages(); }
 
 async function startRun(url, body, label, onDone) {
@@ -1275,6 +1322,7 @@ $("#pkgUpdate").onclick = async (e) => {
 // The Presets card only makes sense with a connected console: hide it (and show a hint) until one is.
 function updatePresetsVisibility() {
   const any = [...consoles.values()].some((c) => c.status === "connected");
+  $("#disconnectAll").hidden = ![...consoles.values()].some((c) => c.status === "connected" || c.status === "connecting");
   $("#pkgCard").hidden = !any;
   $("#presetsCard").hidden = !any;
   $("#presetsHint").hidden = any;
@@ -1375,7 +1423,7 @@ function renderPresets() {
   $("#pkgGroups").innerHTML = CFG.groups.filter((g) => g.section === "packages").map(groupBtn).join("");
   $("#cmdList").innerHTML = CFG.groups
     .map((g) => `<div><b>${esc(g.label)}</b> <span class="muted small">· delay ${g.delay}s${g.results ? " · results exported" : ""}</span>
-      <ol>${g.commands.map((c) => `<li>${esc(typeof c === "string" ? c : c.run)}</li>`).join("")}</ol></div>`)
+      <ol>${g.commands.map((c) => `<li>${esc(typeof c === "string" ? c : c.wait !== undefined ? `⏸ idle ${c.wait}s${c.label ? ` (${c.label})` : ""}` : c.run)}</li>`).join("")}</ol></div>`)
     .join("") + `<div><b>Mount command</b><ol><li>${esc(m.command)}</li></ol><b>Read-ahead command</b><ol><li>${esc(m.read_ahead_command)}</li></ol></div>` +
     (CFG.elbencho ? `<div><b>elbencho commands</b> <span class="muted small">· config section <code>elbencho</code></span><ol>${Object.entries(CFG.elbencho)
       .filter(([k]) => k.endsWith("_command") || k === "check_mount").map(([k, v]) => `<li><code>${esc(k)}</code>: ${esc(v)}</li>`).join("")}</ol></div>` : "");
@@ -1996,6 +2044,7 @@ const SECTION_INFO = {
   vars: "Variables used by onboarding steps and commands", vip_pool: "Candidate IP ranges for the tenant VIP pool",
   tenant_admin: "Tenant admin role and password policy", provisioning: "Tenant onboarding steps (REST calls)",
   ssh: "Default SSH login for clients", clients: "SSH client hosts", mount: "Standard NFSv3 mount and read-ahead",
+  elbencho: "Benchmark size and commands; idle_before_read_seconds = pause between write and read in Auto Write/Read",
   packages: "Required client packages and how to install them", execution: "Delays, timeouts, input prompts",
   command_groups: "Preset buttons in Tab 2",
 };
@@ -2026,7 +2075,8 @@ function renderOverview() {
     card("VIP pool", `${vip.ip_count ?? "?"} IPs`, (vip.ranges || []).map((r) => `${r.start}–${r.end}`).join(", ")),
     card("Clients", (d.clients || []).length, (d.clients || []).map((c) => c.host).join(", ")),
     card("Mount", d.mount?.mount_point || "—", `read-ahead ${d.mount?.read_ahead_kb ?? "?"} KB · VIP ${d.mount?.vip ?? "?"}`),
-    card("Packages", (d.packages?.required || []).length, (d.packages?.required || []).map((p) => p.name).join(", ")),
+    card("Packages", (d.packages?.required || []).length + (d.packages?.system || []).length,
+      [...(d.packages?.required || []).map((p) => p.name), ...(d.packages?.system || []).map((p) => (typeof p === "string" ? p : p?.name))].filter(Boolean).join(", ")),
     card("Execution", `${d.execution?.delay_between_commands_seconds ?? "?"}s delay`, `timeout ${d.execution?.command_timeout_seconds ?? "?"}s`),
   ].join("");
 }

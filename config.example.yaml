@@ -318,6 +318,7 @@ elbencho:
   file_size: 4g            # -s  size of each file (k, m, g, t)
   block_size: 1m           # -b  I/O size for the sequential write/read
   flags: "--direct"        # extra flags for sequential write/read ("" = buffered I/O)
+  idle_before_read_seconds: 30   # Elbencho Auto Write/Read: idle time between the write and the read (0 = none)
   options: "-t ${elbencho.threads} -n ${elbencho.dirs} -N ${elbencho.files} -s ${elbencho.file_size} -b ${elbencho.block_size} ${elbencho.flags}"
   # never write anywhere but the mounted VAST view (an unmounted mount point is just a local directory)
   check_mount: 'mountpoint -q "${mount.mount_point}" || { echo "${mount.mount_point} is not mounted - run Mount NFS first"; exit 1; }'
@@ -336,8 +337,23 @@ elbencho:
 #   check     command that succeeds when the package is installed; first output line = version
 #   package   package name per package manager when it differs from "name"
 #   install   custom install command (used instead of the package manager); also used for "update"
+# system: plain OS package names, checked in the client's package database (dpkg / rpm) and installed or
+#   updated with its package manager (package_managers below). Use { name: x, package: { apt: a, dnf: b } }
+#   when the name differs per distribution. A name also listed under required uses the required entry.
 # ---------------------------------------------------------------------
 packages:
+  system:
+    - curl
+    - numactl          # numactl --hardware: NUMA layout for pinning benchmark threads
+    - sysstat          # iostat / sar / mpstat while a test runs
+    - ethtool          # NIC link speed and driver
+    - pciutils         # lspci: NIC model and PCIe slot
+    - lsof
+    - rsync
+    # RDMA clients (NFS over RDMA): uncomment
+    # - rdma-core
+    # - infiniband-diags   # ibstat
+    # - perftest           # ib_write_bw / ib_read_bw
   required:
     - name: nano
       check: command -v nano >/dev/null && nano --version | head -1   # 'cmd | head' alone would hide a missing cmd
@@ -351,6 +367,8 @@ packages:
       # elbencho is not in the standard repos - install the static binary from GitHub releases.
       # Point this at an internal mirror if the clients have no internet access.
       install: 'curl -fsSL -o /tmp/elbencho.tar.gz https://github.com/breuner/elbencho/releases/latest/download/elbencho-static-$(uname -m).tar.gz && tar -xzf /tmp/elbencho.tar.gz -C /usr/local/bin && elbencho --version | head -1'
+      # Uninstall: the package manager if it owns the binary, otherwise delete the static binary.
+      uninstall: 'P=$(command -v elbencho) || { echo "elbencho is not installed"; exit 0; }; if dpkg -S "$P" >/dev/null 2>&1; then apt-get remove -y elbencho; elif rpm -qf "$P" >/dev/null 2>&1; then if command -v dnf >/dev/null; then dnf remove -y elbencho; else yum remove -y elbencho; fi; else rm -f "$P" && echo "removed $P"; fi'
     - name: vastnfs
       # VAST NFS client driver (multipath "remoteports", NFS over RDMA). Built from source for the running
       # kernel, as in https://docs.vastdata.com/docs/quickstart-multipathing-nfs-client-download-and-install
@@ -401,22 +419,46 @@ packages:
           rpm -qa 'vastnfs*' | sed 's/^/installed: /'
         fi
         echo "== REBOOT the client to load the driver, then click 'Check VAST driver version'"
+      uninstall_label: remove the VAST NFS driver packages (reboot to unload the driver)
+      uninstall: |
+        set -e
+        if command -v apt-get >/dev/null; then
+          P=$(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'vastnfs*' 2>/dev/null | awk '$1 ~ /^i/ {print $2}')
+          [ -n "$P" ] || { echo "no vastnfs package installed"; exit 0; }
+          apt-get purge -y $P
+          update-initramfs -u -k "$(uname -r)"
+        else
+          P=$(rpm -qa 'vastnfs*')
+          [ -n "$P" ] || { echo "no vastnfs package installed"; exit 0; }
+          if command -v dnf >/dev/null; then dnf remove -y $P; else yum remove -y $P; fi
+          dracut -f
+        fi
+        command -v depmod >/dev/null && depmod -a
+        echo "== REBOOT the client to unload the VAST NFS driver; until then Check packages still shows it as loaded"
   package_managers:
     apt:
       install: apt-get update && apt-get install -y ${pkg.names}
       update: apt-get update && apt-get install -y --only-upgrade ${pkg.names}
+      reinstall: apt-get install -y --reinstall ${pkg.names}
+      remove: apt-get remove -y ${pkg.names}
       upgradable: apt list --upgradable 2>/dev/null
     dnf:
       install: dnf install -y ${pkg.names}
       update: dnf upgrade -y ${pkg.names}
+      reinstall: dnf reinstall -y ${pkg.names}
+      remove: dnf remove -y ${pkg.names}
       upgradable: dnf -q check-update
     yum:
       install: yum install -y ${pkg.names}
       update: yum update -y ${pkg.names}
+      reinstall: yum reinstall -y ${pkg.names}
+      remove: yum remove -y ${pkg.names}
       upgradable: yum -q check-update
     zypper:
       install: zypper --non-interactive install ${pkg.names}
       update: zypper --non-interactive update ${pkg.names}
+      reinstall: zypper --non-interactive install -f ${pkg.names}
+      remove: zypper --non-interactive remove ${pkg.names}
       upgradable: zypper -q list-updates
 
 # ---------------------------------------------------------------------
@@ -578,6 +620,8 @@ command_groups:
       - ${elbencho.check_mount}
       - ${elbencho.mkdir_command}
       - ${elbencho.write_command}
+      - wait: ${elbencho.idle_before_read_seconds}   # idle before the read (seconds; set in elbencho)
+        label: idle before read
       - ${elbencho.read_command}
       - ${elbencho.cleanup_command}
 

@@ -6,6 +6,7 @@ Run:  .venv/bin/python dev/mock_ssh.py [port]     (default 127.0.0.1:2222, passw
 Start one per mock client (e.g. 2222 and 2223) - like real hosts.
 """
 import asyncio
+import re
 import random
 import shlex
 from pathlib import Path
@@ -108,9 +109,15 @@ async def handle(process: asyncssh.SSHServerProcess):
         process.stdout.write("@@PM|apt\n")
         versions = {"nano": "GNU nano, version 6.2", "fio": "fio-3.28", "nfs-utils": "mount.nfs present",
                     "elbencho": "elbencho 3.0.19"}
+        # packages.system entries: everything the script asks about that the mock has no version for
+        system = [n for n in re.findall(r"@@PKG\|([^|$]+)\|", cmd) if n not in versions]
+        for name in system:
+            versions[name] = "1.0-1"
         for name, ver in versions.items():
             if name in INSTALLED:
                 process.stdout.write(f"@@PKG|{name}|0|{ver}\n")
+            elif name in system:
+                process.stdout.write(f"@@PKG|{name}|1|not installed\n")
             else:
                 process.stdout.write(f"@@PKG|{name}|127|bash: {name}: command not found\n")
         if "nano" not in UPGRADED:
@@ -125,11 +132,23 @@ async def handle(process: asyncssh.SSHServerProcess):
             process.stdout.write("Abort.\n")
             process.exit(1)
             return
-        names = cmd.split("install -y", 1)[-1].replace("--only-upgrade", "").split()
+        names = cmd.split("install -y", 1)[-1].replace("--only-upgrade", "").replace("--reinstall", "").split()
         for n in names:
             INSTALLED.add("nfs-utils" if n == "nfs-common" else n)
             UPGRADED.add(n)
         process.stdout.write(f"[mock] installed/updated: {' '.join(names)}\n")
+        process.exit(0)
+        return
+    if "apt-get remove -y" in cmd or "apt-get purge -y" in cmd:
+        names = cmd.split(" -y", 1)[-1].split()
+        for n in names:
+            INSTALLED.discard("nfs-utils" if n == "nfs-common" else n)
+        process.stdout.write(f"[mock] removed: {' '.join(names)}\n")
+        process.exit(0)
+        return
+    if "command -v elbencho" in cmd and "rm -f" in cmd:   # elbencho uninstall
+        INSTALLED.discard("elbencho")
+        process.stdout.write("removed /usr/local/bin/elbencho\n")
         process.exit(0)
         return
     if "elbencho.tar.gz" in cmd:

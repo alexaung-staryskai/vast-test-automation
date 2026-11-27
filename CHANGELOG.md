@@ -4,6 +4,31 @@ The app's version is in [`VERSION`](VERSION) and shows next to the title in the 
 Bump it with every change you push: **major** for changes that break existing sites or configs,
 **minor** for new features, **patch** for fixes and docs.
 
+## 1.5.0
+- **`packages.system`** in the config: a plain list of OS packages (e.g. `curl`, `numactl`, `sysstat`, `ethtool`,
+  `pciutils`) to check and install on the clients. Each is checked in the client's package database (`dpkg-query` /
+  `rpm -q`, so library packages without a command are found too) and installed or updated with the client's package
+  manager, together with the required packages. Use `{ name: x, package: { apt: a, dnf: b } }` when the name differs
+  per distribution. Edit it in ⚙ Configuration → packages → system (one per line). New sites start with a suggested
+  list; existing sites got an empty one.
+- The **Required packages** table now has one row per package and one column per client, so a long list fits.
+- **Install / Reinstall / Uninstall each package**: buttons in every cell of the Required packages table act on that
+  client; **Install on all / Reinstall on all / Uninstall from all** under the package name act on every ticked client it
+  applies to. Reinstall and Uninstall ask first. Packages are checked again afterwards.
+  - Repo packages use the package manager (`apt-get install --reinstall` / `apt-get remove`, `dnf reinstall` /
+    `dnf remove`, …), set as `reinstall` / `remove` under `package_managers` (built-in defaults for older configs).
+  - Packages with their own install script need an `uninstall` command: added for **elbencho** (deletes the static
+    binary) and **vastnfs** (purges the driver packages and rebuilds the initramfs; reboot to unload the driver).
+    `reinstall` is optional and defaults to the install command.
+- **Elbencho Auto Write/Read** idles between the write and the read: `elbencho.idle_before_read_seconds`
+  (⚙ Configuration → elbencho; 30 by default, 0 = no idle). The app waits with a countdown in each console
+  (nothing runs on the client) and the idle shows in the run log; it replaces the usual pause between commands there.
+  Any preset can use an idle step: `- wait: <seconds>` (with an optional `label:`) in its `commands`.
+- **⏏ Disconnect all** (Consoles card, next to Open all configured): closes the SSH connection of every console
+  after a confirmation. The consoles and their output stay; ↻ Reconnect each one to connect again. A console that is
+  running a preset is left connected and named in a message.
+- On RHEL-family clients, `packages.system` also counts a package that *provides* the name (`curl-minimal` for `curl`).
+
 ## 1.4.0
 - **✓ Verify on VMS** opens a window that shows each check live: connect to the VMS, then one GET per object
   onboarding created (tenant, VIP pool, view policy, view, quota, …) with what the VMS returned and how long it took,

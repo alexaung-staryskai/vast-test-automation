@@ -307,6 +307,7 @@ mount:
   read_ahead_kb: 16384
   read_ahead_command: DEV=$(mountpoint -d ${mount.mount_point}) && echo ${mount.read_ahead_kb} > /sys/class/bdi/$DEV/read_ahead_kb && echo "read_ahead_kb for $DEV = $(cat /sys/class/bdi/$DEV/read_ahead_kb)"
 packages:
+  system: [curl, numactl, sysstat, ethtool]   # OS packages checked in dpkg / rpm
   required:
   - name: nano
     check: nano --version | head -1
@@ -323,22 +324,31 @@ packages:
     check: elbencho --version | head -1
     install: curl -fsSL -o /tmp/elbencho.tar.gz https://github.com/breuner/elbencho/releases/latest/download/elbencho-static-$(uname -m).tar.gz && tar -xzf /tmp/elbencho.tar.gz -C /usr/local/bin && elbencho
       --version | head -1
+    uninstall: 'P=$(command -v elbencho) || { echo "elbencho is not installed"; exit 0; }; rm -f "$P" && echo "removed $P"'
   package_managers:
     apt:
       install: apt-get update && apt-get install -y ${pkg.names}
       update: apt-get update && apt-get install -y --only-upgrade ${pkg.names}
+      reinstall: apt-get install -y --reinstall ${pkg.names}
+      remove: apt-get remove -y ${pkg.names}
       upgradable: apt list --upgradable 2>/dev/null
     dnf:
       install: dnf install -y ${pkg.names}
       update: dnf upgrade -y ${pkg.names}
+      reinstall: dnf reinstall -y ${pkg.names}
+      remove: dnf remove -y ${pkg.names}
       upgradable: dnf -q check-update
     yum:
       install: yum install -y ${pkg.names}
       update: yum update -y ${pkg.names}
+      reinstall: yum reinstall -y ${pkg.names}
+      remove: yum remove -y ${pkg.names}
       upgradable: yum -q check-update
     zypper:
       install: zypper --non-interactive install ${pkg.names}
       update: zypper --non-interactive update ${pkg.names}
+      reinstall: zypper --non-interactive install -f ${pkg.names}
+      remove: zypper --non-interactive remove ${pkg.names}
       upgradable: zypper -q list-updates
 execution:
   delay_between_commands_seconds: 1
@@ -373,6 +383,8 @@ command_groups:
   - mountpoint -q "${mount.mount_point}" || { echo "${mount.mount_point} is not mounted - run Mount NFSv3 first"; exit 1; }
   - mkdir -p "${mount.mount_point}/elbencho/${client.name}"
   - elbencho --nolive -w -d -t 32 -n 1 -N 8 -s 4g -b 1m --direct "${mount.mount_point}/elbencho/${client.name}"
+  - wait: 3                 # idle before the read (seconds)
+    label: idle before read
   - elbencho --nolive -r -t 32 -n 1 -N 8 -s 4g -b 1m --direct "${mount.mount_point}/elbencho/${client.name}"
   - elbencho --nolive -F -D -t 32 -n 1 -N 8 "${mount.mount_point}/elbencho/${client.name}"
 - id: unmount

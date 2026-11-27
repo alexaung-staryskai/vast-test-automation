@@ -157,6 +157,12 @@ table.pkgs { border-collapse: collapse; width: 100%; font-size: 13px; }
 .pkgs th, .pkgs td { padding: 5px 8px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
 .pkgs th { color: var(--muted); font-weight: 500; font-size: 12px; }
 .pk-ok { color: var(--ok); } .pk-miss { color: var(--bad); font-weight: 600; } .pk-upd { color: var(--warn); font-weight: 600; }
+.pk-acts { display: flex; gap: 4px; margin-top: 4px; flex-wrap: wrap; }
+.pk-btn { font: inherit; font-size: 11px; padding: 1px 7px; border-radius: 6px; border: 1px solid var(--border); background: transparent; color: var(--muted); cursor: pointer; }
+.pk-btn:hover { color: var(--fg, inherit); border-color: var(--accent, var(--border)); }
+.pk-btn.danger:hover { color: var(--bad); border-color: var(--bad); }
+.pk-row .pk-btn { font-size: 10.5px; }
+.pk-btn:disabled { opacity: .5; cursor: wait; }
 .pkgs .ver { display: block; font-size: 11px; color: var(--muted); max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ---- waiting for input ---- */

@@ -79,6 +79,10 @@ def load_config(path: Path | None = None) -> tuple[dict, list[str]]:
     cfg.setdefault("mount", {})
     cfg.setdefault("packages", {}).setdefault("required", [])
     cfg["packages"].setdefault("package_managers", {})
+    cfg["packages"].setdefault("system", [])
+    if not isinstance(cfg["packages"]["system"], list):
+        warnings.append("packages.system must be a list of package names. Fix it in ⚙ Configuration (packages → system).")
+        cfg["packages"]["system"] = []
     cfg.setdefault("tenant_admin", {})
     cfg["_path"] = str(path)
     cfg["_dir"] = str(path.parent)  # the test site folder; relative paths resolve against it

@@ -548,7 +548,9 @@ def get_config() -> dict:
         "vip_pool": c.get("vip_pool", {}),
         "mount": c.get("mount", {}),
         "elbencho": c.get("elbencho", {}),
-        "packages": [p["name"] for p in c["packages"].get("required", [])],
+        "packages": [p["name"] for p in packages.entries(c["packages"])],
+        "package_info": {p["name"]: {"custom": bool(p.get("install")), "uninstall": packages.can_uninstall(p),
+                                     "system": bool(p.get("system"))} for p in packages.entries(c["packages"])},
         "clients": [{"name": cl["name"], "host": cl["host"], "username": cl.get("username", c["ssh"].get("username")),
                      "port": int(cl.get("port", c["ssh"].get("port", 22))),
                      "password_saved": cl["name"] in _client_secrets()}
@@ -1781,7 +1783,7 @@ async def packages_check(body: PkgCheckIn) -> dict:
     group = {"id": "packages-check", "label": "Check packages", "sudo": False, "parse": "packages",
              "pkg_cfg": pkg_cfg, "delay_between_commands_seconds": 0,
              "commands": [{"run": packages.check_script(pkg_cfg),
-                           "display": "check: " + ", ".join(p["name"] for p in pkg_cfg.get("required", []))}]}
+                           "display": "check: " + ", ".join(p["name"] for p in packages.entries(pkg_cfg))}]}
     return _start(group, body.session_ids)
 
 
@@ -1821,6 +1823,39 @@ async def packages_install(body: PkgInstallIn) -> dict:
                              else "Nothing to update"))
     label = "Install missing packages" if body.mode == "missing" else "Update packages"
     group = {"id": f"packages-{body.mode}", "label": label, "per_session": per_session}
+    return _start(group, list(per_session))
+
+
+class PkgActionIn(BaseModel):
+    session_ids: list[str]
+    package: str
+    action: str                      # install | reinstall | uninstall
+
+
+@app.post("/api/packages/action")
+async def packages_action(body: PkgActionIn) -> dict:
+    """Install, reinstall or uninstall one package on the given clients (those it applies to)."""
+    pkg_cfg = state.cfg["packages"]
+    per_session: dict[str, list] = {}
+    errors = []
+    for sid in body.session_ids:
+        st = state.sessions.pkg_status.get(sid)
+        if not st:
+            continue
+        try:
+            cmd = packages.action_command(pkg_cfg, st, body.package, body.action)
+        except ValueError as e:
+            errors.append(f"{state.sessions.sessions[sid].client['name']}: {e}")
+            continue
+        if cmd:
+            per_session[sid] = [cmd]
+    if not per_session:
+        raise HTTPException(400, "; ".join(dict.fromkeys(errors)) or
+                            f"Nothing to {body.action}: '{body.package}' is "
+                            f"{'already installed' if body.action == 'install' else 'not installed'} on these clients"
+                            " (or run 'Check packages' first)")
+    label = f"{body.action.capitalize()} {body.package}"
+    group = {"id": f"packages-{body.action}", "label": label, "per_session": per_session}
     return _start(group, list(per_session))
 
 
