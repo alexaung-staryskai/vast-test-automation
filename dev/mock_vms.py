@@ -15,6 +15,28 @@ DB: dict[str, dict[int, dict]] = {
     "tenants": {1: {"id": 1, "name": "default", "local_provider_id": 1}},
     "localproviders": {1: {"id": 1, "name": "default", "assigned_tenants_preview": "default"}},
 }
+
+
+def _hardware() -> None:
+    """A small split cluster for the report's network page: 3 CBoxes / CNodes, 1 Ceres v2 DBox with 2 DNodes,
+    200G NICs (CNode: 2 external + 2 internal, DNode: 2 internal)."""
+    DB["cboxes"] = {i: {"id": i, "name": f"cbox-{i}"} for i in (1, 2, 3)}
+    DB["cnodes"] = {i: {"id": i, "name": f"cnode-{i}", "cbox_id": i, "box_vendor": "mock CBox, two dual-port NICs"} for i in (1, 2, 3)}
+    DB["dboxes"] = {1: {"id": 1, "name": "dbox-1", "hardware_type": "ceres_v2"}}
+    DB["dnodes"] = {i: {"id": i, "name": f"dnode-{i}", "dbox_id": 1} for i in (1, 2)}
+    nics, n = {}, 1
+    for c in (1, 2, 3):
+        for kind in ("External", "External", "Internal", "Internal"):
+            nics[n] = {"id": n, "cbox_id": c, "dbox_id": None, "host_id": c, "port_type": kind, "rate": "200 Gb/sec", "rate_number": 200}
+            n += 1
+    for d in (1, 2):
+        for _ in range(2):
+            nics[n] = {"id": n, "cbox_id": None, "dbox_id": 1, "host_id": 10 + d, "port_type": "Internal", "rate": "200 Gb/sec", "rate_number": 200}
+            n += 1
+    DB["nics"] = nics
+
+
+_hardware()
 BASE = "/api/v8"
 
 
@@ -33,6 +55,32 @@ def clusters(req: Request):
 def computeclusters(req: Request):
     _auth(req)
     return [{"name": "cc1", "static_ip_ranges": [["10.20.0.40", "10.20.0.44"]], "server_kube_vip_address": "10.20.0.60"}]
+
+
+@app.get(BASE + "/monitors/ad_hoc_query/")
+def ad_hoc_query(req: Request):
+    """Cluster metrics every 10 s between from_time and to_time: bandwidth in bytes/s, latency in microseconds
+    (as the real VMS returns them)."""
+    import random
+    from datetime import datetime, timedelta
+    _auth(req)
+    q = req.query_params
+    props = q.getlist("prop_list")
+    try:
+        a = datetime.fromisoformat(q.get("from_time", "").replace("Z", "+00:00"))
+        b = datetime.fromisoformat(q.get("to_time", "").replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(400, {"detail": "from_time / to_time required"})
+    rows, t = [], a + timedelta(seconds=10 - a.second % 10)
+    while t <= b:
+        vals = []
+        for p in props:
+            k = p.rsplit(",", 1)[-1]
+            vals.append(round(random.uniform(9.0, 11.0) * 1e9) if k.endswith("_bw") else
+                        round(random.uniform(9000, 11000)) if k.endswith("_iops") else round(random.uniform(350, 450), 2))
+        rows.append([t.strftime("%Y-%m-%dT%H:%M:%SZ"), 1, *vals])
+        t += timedelta(seconds=10)
+    return {"object_ids": [1], "prop_list": ["timestamp", "object_id", *props], "data": rows[::-1]}
 
 
 @app.post(BASE + "/users/{uid}/access_keys/")

@@ -304,3 +304,12 @@ Last updated: 2026-11-24.
 - The scan reads `GET /localproviders/{tenant.local_provider_id}/` and includes it only when it is not `default` (id 1), no other tenant uses it, and `assigned_tenants_preview` is empty or the tenant's own name.
 - First tried before the tenant; on the real VMS that fails with HTTP 409 "It is forbidden to delete VAST provider …" while the tenant exists. So it is now the last step, after the tenant (also after a force delete), with a fresh check that no tenant uses it. Force delete ignores the provider when checking "nothing else left".
 - Tenant already gone: the scan looks for an unassigned provider named exactly `provider-<tenant>` that no tenant uses, shows it in the review and deletes it. Anything else is left alone.
+
+## Performance report: Word format and report template (2026-11-27)
+
+- The Word report is built with python-docx on the site's uploaded template (`<site>/report-template.docx`, .docx or .dotx). Page setup, headers / footers (logo) and the styles Title, Heading 1/2, List Bullet and Table Grid come from the template; missing styles fall back to plain formatting.
+- Placeholders `{{title}} {{site}} {{tenant}} {{date}} {{author}} {{vms}} {{period}}` are replaced in body, tables, headers and footers. A paragraph holding only `{{content}}` marks where the report is inserted (cover page / appendix kept); without it the template body is replaced. Images of the template body that are no longer used are dropped from the report.
+- Word can't hold python-pptx's native charts, so the Word charts and network diagram are images drawn with matplotlib.
+- The calculations (prepare, expected_checks, cluster_compare) are shared by both reports, so the numbers match.
+- Site configuration export / import (no logs) includes the template.
+- dev/mock_vms.py has a small split-cluster inventory (3 CNodes, 1 Ceres v2 DBox, 200G NICs) and `/monitors/ad_hoc_query/`; dev/mock_ssh.py prints latency lines for elbencho `--lat`, so every report page can be tried without a cluster.

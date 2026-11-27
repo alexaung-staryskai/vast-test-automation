@@ -39,7 +39,10 @@ def fake_elbencho(cmd: str) -> str:
         f"            IOPS             :      {mib}       {mib - 40}\n"
         f"            Throughput MiB/s :      {mib}       {mib - 40}\n"
         f"            Total MiB        :      {mib * 10}      {mib * 10 + 300}\n"
-        "---\n"
+        + ("            IO latency       : [ min=420us avg=1.45ms max=26.3ms ]\n"
+           f"            IO lat % us      : [ 1%<=560 50%<=1216 75%<=1904 99%<={random.randint(3400, 3900)} 99.9%<=4928 ]\n"
+           if "--lat" in cmd else "")
+        + "---\n"
     )
 
 
