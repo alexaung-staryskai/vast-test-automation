@@ -133,8 +133,9 @@ def _log_entry(stem: str, files: list[Path], perf_groups: set[str]) -> dict:
             for line in md.read_text(errors="replace").splitlines():
                 if line.startswith("- Runs:") and "clients:" in line:
                     clients = [c.strip() for c in line.split("clients:", 1)[1].split(",") if c.strip() and c.strip() != "-"]
-        entry.update(type="report", label="Performance report (PowerPoint)", status="done", clients=clients,
-                     performance=True)
+        fmts = [n for suf, n in ((".pptx", "PowerPoint"), (".docx", "Word")) if any(f.suffix == suf for f in files)]
+        entry.update(type="report", label=f"Performance report ({' + '.join(fmts) or 'summary'})", status="done",
+                     clients=clients, performance=True)
     elif kind.startswith("console-"):
         entry.update(type="console", label=f"Console export: {kind[len('console-'):]}")
     elif js is not None:
@@ -160,7 +161,7 @@ def list_logs(perf_groups: set[str]) -> list[dict]:
         return []
     groups: dict[str, list[Path]] = {}
     for p in RESULTS_DIR.iterdir():
-        if p.is_file() and p.suffix in (".json", ".txt", ".md", ".pptx") and not p.name.startswith("."):
+        if p.is_file() and p.suffix in (".json", ".txt", ".md", ".pptx", ".docx") and not p.name.startswith("."):
             groups.setdefault(p.stem, []).append(p)
     logs = [_log_entry(stem, files, perf_groups) for stem, files in groups.items()]
     logs.sort(key=lambda e: (e.get("time") or "", e["mtime"]), reverse=True)

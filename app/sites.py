@@ -219,6 +219,154 @@ def export_zip(path: Path, include_results: bool = True) -> bytes:
     return buf.getvalue()
 
 
+# ---- site configuration export / import (no logs) ----
+MANIFEST = "vast-test-bench-site.json"
+SECRET_FILES = (".client-secrets.json", ".tenant-secrets.json")
+STATE_FILE = ".provision_state.json"          # onboarding state (created object ids, generated password)
+MAX_IMPORT_BYTES = 40 * 1024 * 1024
+REPORT_TEMPLATE = "report-template.docx"        # Word report template uploaded in ⚙ Configuration
+
+
+def _site_files(path: Path) -> tuple[str, str]:
+    """(tenants file, results dir) names from the site's config.yaml."""
+    try:
+        app_cfg = (yaml.safe_load((path / "config.yaml").read_text()) or {}).get("app") or {}
+    except (OSError, yaml.YAMLError):
+        app_cfg = {}
+    return str(app_cfg.get("tenants_file", "tenants.yaml")), str(app_cfg.get("results_dir", "results"))
+
+
+def export_config_zip(path: Path, include_secrets: bool = False, app_version: str = "") -> tuple[bytes, list[str]]:
+    """Everything that configures the site - no logs / results, no config backups:
+    config.yaml (VMS connection, onboarding settings, VIP pool, clients, presets, custom commands, report targets),
+    site.yaml (name, description, status), the tenants file and the Word report template. include_secrets adds the saved passwords
+    (.client-secrets.json, .tenant-secrets.json) and the onboarding state."""
+    tfile, rdir = _site_files(path)
+    files = [("config.yaml", path / "config.yaml"), ("site.yaml", path / "site.yaml")]
+    if "/" not in tfile and ".." not in tfile:
+        files.append((tfile, path / tfile))
+    files.append((REPORT_TEMPLATE, path / REPORT_TEMPLATE))     # uploaded Word report template
+    if include_secrets:
+        files += [(n, path / n) for n in SECRET_FILES]
+        files.append((f"results/{STATE_FILE}", path / rdir / STATE_FILE))
+    files = [(n, f) for n, f in files if f.is_file()]
+    meta = info(path)
+    manifest = {"format": 1, "kind": "vast-test-bench-site", "app_version": app_version, "exported_at": _now(),
+                "site": {"name": meta["name"], "description": meta["description"], "vms": meta["vms"]},
+                "files": [n for n, _ in files], "includes_secrets": include_secrets, "tenants_file": tfile}
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(f"{path.name}/{MANIFEST}", json.dumps(manifest, indent=2))
+        for n, f in files:
+            if n == "site.yaml":   # no local absolute paths (user name, folders) in a zip that gets shared
+                try:
+                    m = yaml.safe_load(f.read_text()) or {}
+                    cf = str(m.get("copied_from") or "")
+                    if cf.startswith(("/", "~")) or re.match(r"^[A-Za-z]:[\\/]", cf):
+                        parts = Path(cf).parts
+                        m["copied_from"] = "/".join(parts[-3:]) if "sites" in parts[-3:-1] else Path(cf).name
+                    z.writestr(f"{path.name}/{n}", yaml.safe_dump(m, sort_keys=False))
+                    continue
+                except (OSError, yaml.YAMLError):
+                    pass
+            z.write(f, f"{path.name}/{n}")
+    return buf.getvalue(), [n for n, _ in files]
+
+
+def import_zip(data: bytes, filename: str = "") -> dict:
+    """Create a new site from a site zip (this app's configuration export, or a full / 'without results' download).
+    Only configuration is taken: logs, results and backups in the zip are skipped. Never overwrites a site."""
+    import posixpath
+    from . import config_store
+    if len(data) > MAX_IMPORT_BYTES:
+        raise ValueError("The file is too large for a site configuration (over 40 MB) - export it without logs")
+    try:
+        z = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise ValueError("Not a zip file - choose a site .zip exported from VAST Test Bench")
+    names = [n for n in z.namelist() if not n.endswith("/")]
+    for n in names:
+        parts = n.replace("\\", "/").split("/")
+        if n.startswith("/") or ".." in parts or ":" in parts[0]:
+            raise ValueError(f"Unsafe path in the zip: {n}")
+    cfgs = [n for n in names if posixpath.basename(n) == "config.yaml" and n.count("/") <= 1]
+    if len(cfgs) != 1:
+        raise ValueError("The zip must contain one site (a config.yaml at the top or in one folder)")
+    root = posixpath.dirname(cfgs[0])
+    pre = f"{root}/" if root else ""
+    rel = {n[len(pre):]: n for n in names if n.startswith(pre)}
+    def read(n: str) -> bytes:
+        info_ = z.getinfo(rel[n])
+        if info_.file_size > MAX_IMPORT_BYTES:
+            raise ValueError(f"{n} is too large")
+        return z.read(rel[n])
+    try:
+        cfg_text = read("config.yaml").decode("utf-8")
+        cfg = yaml.safe_load(cfg_text) or {}
+    except (UnicodeDecodeError, yaml.YAMLError) as e:
+        raise ValueError(f"config.yaml can't be read: {e}")
+    errors = config_store.validate(cfg)
+    if errors:
+        raise ValueError("config.yaml is not valid: " + "; ".join(errors[:3]))
+    meta: dict = {}
+    if "site.yaml" in rel:
+        try:
+            meta = yaml.safe_load(read("site.yaml").decode("utf-8")) or {}
+        except (UnicodeDecodeError, yaml.YAMLError):
+            meta = {}
+    manifest: dict = {}
+    if MANIFEST in rel:
+        try:
+            manifest = json.loads(read(MANIFEST))
+        except ValueError:
+            manifest = {}
+    app_cfg = cfg.get("app") or {}
+    tfile = str(app_cfg.get("tenants_file", "tenants.yaml"))
+    rdir = str(app_cfg.get("results_dir", "results"))
+    wanted = {"config.yaml": "config.yaml", "site.yaml": "site.yaml"}
+    if "/" not in tfile and ".." not in tfile:
+        wanted[tfile] = tfile
+    for n in SECRET_FILES:
+        wanted[n] = n
+    wanted[REPORT_TEMPLATE] = REPORT_TEMPLATE
+    wanted[f"results/{STATE_FILE}"] = f"{rdir}/{STATE_FILE}" if "/" not in rdir and ".." not in rdir else None
+    skipped = sorted(n for n in rel if n not in wanted and n != MANIFEST)
+    # a unique display name and folder
+    base = str(meta.get("name") or manifest.get("site", {}).get("name") or root or Path(filename).stem or "Imported site").strip()
+    base = re.sub(r"[^A-Za-z0-9 ._-]+", "-", base)[:58].strip(" .-_") or "Imported site"
+    if not NAME_RE.match(base):
+        base = "Imported site"
+    taken = {s["name"] for s in list_sites()}
+    name, i = base, 2
+    while name in taken or (SITES_DIR / slug(name)).exists():
+        name, i = f"{base}-{i}", i + 1
+    path = SITES_DIR / slug(name)
+    path.mkdir(parents=True)
+    written = []
+    try:
+        (path / "results").mkdir(exist_ok=True)
+        for src, dst in wanted.items():
+            if src not in rel or dst is None or src == "site.yaml":
+                continue
+            target = path / dst
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(read(src))
+            if posixpath.basename(dst).startswith("."):
+                target.chmod(0o600)                       # passwords / keys / onboarding state: owner only
+            written.append(src)
+        meta.update(name=name, imported_at=_now(), imported_from=filename or "zip")
+        meta.setdefault("description", "")
+        meta.setdefault("created_at", _now())
+        (path / "site.yaml").write_text(yaml.safe_dump(meta, sort_keys=False))
+        written.append("site.yaml")
+    except Exception:
+        shutil.rmtree(path, ignore_errors=True)
+        raise
+    return {"path": str(path.resolve()), "name": name, "files": sorted(written), "skipped": skipped,
+            "renamed": name != base, "includes_secrets": any(n in written for n in SECRET_FILES),
+            "from_version": manifest.get("app_version")}
+
+
 # ---- app-wide delete log (sites/.delete-log.jsonl): survives the site folder moving to the trash ----
 AUDIT_FILE = SITES_DIR / ".delete-log.jsonl"
 

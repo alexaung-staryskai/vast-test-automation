@@ -8,7 +8,7 @@ from pathlib import Path
 
 import httpx
 
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -495,6 +495,34 @@ def export_site(include_results: bool = True) -> Response:
     data = sites.export_zip(state.site, include_results=include_results)
     return Response(data, media_type="application/zip",
                     headers={"Content-Disposition": f'attachment; filename="{state.site.name}.zip"'})
+
+
+@app.get("/api/sites/export-config")
+def export_site_config(path: str = "", include_secrets: bool = False) -> Response:
+    """The site's configuration without logs (config.yaml, site.yaml, tenants file; optionally saved passwords)."""
+    try:
+        p = sites.resolve(path) if path else state.site
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not p:
+        raise HTTPException(409, "No test site is open")
+    data, files = sites.export_config_zip(p, include_secrets=include_secrets, app_version=APP_VERSION)
+    tag = "config-with-passwords" if include_secrets else "config"
+    return Response(data, media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{p.name}-{tag}.zip"', "X-Site-Files": ",".join(files)})
+
+
+@app.post("/api/sites/import")
+async def import_site(request: Request, filename: str = "") -> dict:
+    """Create a new test site from an uploaded site zip (request body = the zip). Logs in the zip are skipped."""
+    data = await request.body()
+    if not data:
+        raise HTTPException(400, "Choose a site .zip to import")
+    try:
+        res = sites.import_zip(data, filename)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return res
 
 
 # ---------------------------------------------------------------- config
@@ -1871,10 +1899,218 @@ def download_archive(name: str) -> FileResponse:
 class PerfReportIn(BaseModel):
     runs: list[str] = []      # run ids (results/<id>.json); empty = every performance run of the site
     unit: str = "GB"
+    expected: dict | None = None    # {read_gbps, write_gbps, read_iops, write_iops, p99_ms, basis}; saved as report.expected
+    cluster_metrics: bool = True    # read the cluster's own numbers for each run from the VMS
+    labels: dict | None = None      # {front_switch, back_switch, dbox_model, author}; saved as report.labels
+    formats: list[str] = ["pptx"]   # "pptx" and / or "docx"
+
+
+EXPECTED_KEYS = ("read_gbps", "write_gbps", "read_iops", "write_iops", "p99_ms", "basis")
+
+
+LABEL_KEYS = ("front_switch", "back_switch", "dbox_model", "author")
+
+
+# ---- Word report template (⚙ Configuration -> Report template), one per site: <site>/report-template.docx ----
+def _template_path() -> Path:
+    if not state.site:
+        raise HTTPException(409, "No test site is open")
+    return state.site / sites.REPORT_TEMPLATE
+
+
+@app.get("/api/reports/word-template")
+def word_template_info() -> dict:
+    from . import word_report
+    p = _template_path()
+    meta = (state.cfg.get("report") or {}).get("word_template") or {}
+    if not p.is_file():
+        return {"exists": False}
+    try:
+        chk = word_report.check_template(p.read_bytes())
+    except ValueError as e:
+        chk = {"error": str(e)}
+    return {"exists": True, "name": meta.get("name") or p.name, "uploaded_at": meta.get("uploaded_at"),
+            "size": p.stat().st_size, **chk}
+
+
+@app.get("/api/reports/word-template/file")
+def word_template_file() -> FileResponse:
+    p = _template_path()
+    if not p.is_file():
+        raise HTTPException(404, "No template uploaded")
+    meta = (state.cfg.get("report") or {}).get("word_template") or {}
+    return FileResponse(p, filename=meta.get("name") or p.name)
+
+
+@app.get("/api/reports/word-template/starter")
+def word_template_starter() -> Response:
+    from . import word_report
+    return Response(word_report.starter_template(),
+                    media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    headers={"Content-Disposition": 'attachment; filename="performance-report-template.docx"'})
+
+
+@app.put("/api/reports/word-template")
+async def word_template_upload(request: Request, filename: str = "") -> dict:
+    from . import word_report
+    p = _template_path()
+    data = await request.body()
+    if not data:
+        raise HTTPException(400, "Choose a .docx or .dotx file")
+    if filename and not filename.lower().endswith((".docx", ".dotx")):
+        raise HTTPException(400, "Upload a Word document (.docx) or Word template (.dotx)")
+    try:
+        chk = word_report.check_template(data)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    p.write_bytes(data)
+    meta = {"name": (filename or "report-template.docx")[:120], "uploaded_at": results_now()}
+    raw = config_store.read_raw(config_path())["data"]
+    raw.setdefault("report", {})["word_template"] = meta
+    res = config_store.save_data(config_path(), raw)
+    if not res["ok"]:
+        raise HTTPException(400, {"errors": res["errors"]})
+    state.cfg.setdefault("report", {})["word_template"] = meta
+    return {"exists": True, **meta, "size": len(data), **chk}
+
+
+@app.delete("/api/reports/word-template")
+def word_template_delete() -> dict:
+    p = _template_path()
+    p.unlink(missing_ok=True)
+    raw = config_store.read_raw(config_path())["data"]
+    if (raw.get("report") or {}).pop("word_template", None) is not None:
+        res = config_store.save_data(config_path(), raw)
+        if not res["ok"]:
+            raise HTTPException(400, {"errors": res["errors"]})
+    (state.cfg.get("report") or {}).pop("word_template", None)
+    return {"exists": False}
+
+
+@app.get("/api/reports/labels")
+def get_labels() -> dict:
+    return {k: v for k, v in ((state.cfg.get("report") or {}).get("labels") or {}).items() if k in LABEL_KEYS}
+
+
+def _save_labels(lab: dict) -> dict:
+    clean = {k: str(lab.get(k)).strip()[:60] for k in LABEL_KEYS if str(lab.get(k) or "").strip()}
+    data = config_store.read_raw(config_path())["data"]
+    if ((data.get("report") or {}).get("labels") or {}) != clean:
+        data.setdefault("report", {})["labels"] = clean
+        res = config_store.save_data(config_path(), data)
+        if not res["ok"]:
+            raise HTTPException(400, {"errors": res["errors"]})
+        state.cfg.setdefault("report", {})["labels"] = clean
+    return clean
+
+
+@app.get("/api/reports/expected")
+def get_expected() -> dict:
+    return {k: v for k, v in ((state.cfg.get("report") or {}).get("expected") or {}).items() if k in EXPECTED_KEYS}
+
+
+def _save_expected(exp: dict) -> dict:
+    clean: dict = {}
+    for k in EXPECTED_KEYS:
+        v = exp.get(k)
+        if v in (None, ""):
+            continue
+        if k == "basis":
+            clean[k] = str(v).strip()[:300]
+            continue
+        try:
+            n = float(str(v).replace(",", ""))
+        except ValueError:
+            raise HTTPException(400, f"Expected {k.replace('_', ' ')} must be a number")
+        if n < 0:
+            raise HTTPException(400, f"Expected {k.replace('_', ' ')} can't be negative")
+        clean[k] = n
+    data = config_store.read_raw(config_path())["data"]
+    if ((data.get("report") or {}).get("expected") or {}) != clean:
+        data.setdefault("report", {})["expected"] = clean
+        res = config_store.save_data(config_path(), data)
+        if not res["ok"]:
+            raise HTTPException(400, {"errors": res["errors"]})
+        state.cfg.setdefault("report", {})["expected"] = clean
+    return clean
+
+
+def _hardware(inv: dict) -> dict:
+    """Box counts, models and NIC speeds for the topology page (split: CBoxes + DBoxes, converged: EBoxes)."""
+    from collections import Counter
+    nics = inv.get("nics") or []
+    def speed(pred):
+        rates = Counter(int(n.get("rate_number") or 0) for n in nics if pred(n) and n.get("rate_number"))
+        return rates.most_common(1)[0][0] if rates else None
+    def per_node(pred, node_key):
+        per = Counter(n.get(node_key) or n.get("host_id") or n.get("hostname") for n in nics if pred(n))
+        return max(per.values()) if per else None
+    is_c = lambda n: bool(n.get("cbox_id")) and not n.get("dbox_id")   # noqa: E731
+    is_d = lambda n: bool(n.get("dbox_id"))                             # noqa: E731
+    is_e = lambda n: bool(n.get("ebox_id"))                             # noqa: E731
+    ext = lambda n: str(n.get("port_type")).lower() == "external"       # noqa: E731
+    intl = lambda n: str(n.get("port_type")).lower() == "internal"      # noqa: E731
+    dboxes = inv.get("dboxes") or []
+    models = Counter(str(d.get("hardware_type") or "") for d in dboxes if d.get("hardware_type"))
+    eboxes = inv.get("eboxes") or []
+    return {
+        "design": "converged" if eboxes else "split",
+        "cboxes": len(inv.get("cboxes") or []), "cnodes": len(inv.get("cnodes") or []),
+        "dboxes": len(dboxes), "dnodes": len(inv.get("dnodes") or []), "eboxes": len(eboxes),
+        "dbox_model": models.most_common(1)[0][0] if models else "",
+        "cnode_vendor": next((str(c.get("box_vendor")) for c in inv.get("cnodes") or [] if c.get("box_vendor")), ""),
+        "fe_speed": speed(lambda n: (is_c(n) or is_e(n)) and ext(n)), "fe_ports": per_node(lambda n: (is_c(n) or is_e(n)) and ext(n), "host_id"),
+        "be_speed": speed(lambda n: is_c(n) and intl(n)) or speed(lambda n: is_e(n) and intl(n)),
+        "be_ports": per_node(lambda n: is_c(n) and intl(n), "host_id"),
+        "d_speed": speed(lambda n: is_d(n) and intl(n)), "d_ports": per_node(lambda n: is_d(n) and intl(n), "host_id"),
+    }
+
+
+async def _cluster_for_report(windows: dict) -> dict:
+    """Cluster name / version / CNode and DBox counts, and per-run cluster metrics (10 s samples) from the VMS.
+    Best effort: anything the VMS doesn't answer is left out of the report."""
+    from datetime import timedelta, timezone
+    from .config import to_list
+    client = VMSClient(state.cfg)
+    out: dict = {"info": {}, "runs": {}}
+    try:
+        r = await client.request("GET", "/clusters/")
+        items = to_list(r["body"]) if r["ok"] else []
+        if items and isinstance(items[0], dict):
+            out["info"].update(name=items[0].get("name"), version=items[0].get("sw_version"))
+        inv: dict = {}
+        for ep in ("cboxes", "cnodes", "dboxes", "dnodes", "eboxes", "nics"):
+            r = await client.request("GET", f"/{ep}/", params={"page_size": 1000})
+            inv[ep] = [x for x in to_list(r["body"]) if isinstance(x, dict)] if r["ok"] else None
+        out["info"].update(cnodes=len(inv["cnodes"] or []) or None, dboxes=len(inv["dboxes"] or []) or None)
+        out["info"]["hw"] = _hardware(inv)
+    except Exception:  # noqa: BLE001
+        pass
+    names = {k: f"ProtoMetrics,proto_name=ProtoCommon,{k}" for k in ("rd_bw", "wr_bw", "rd_iops", "wr_iops", "rd_latency", "wr_latency")}
+    for run_id, (a, b) in windows.items():
+        try:
+            fmt = lambda t: t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
+            r = await client.request("GET", "/monitors/ad_hoc_query/", params={
+                "object_type": "cluster", "from_time": fmt(a - timedelta(seconds=5)), "to_time": fmt(b + timedelta(seconds=10)),
+                "granularity": "seconds", "prop_list": list(names.values())})
+            body = r["body"] if r["ok"] and isinstance(r["body"], dict) else {}
+            cols = list(body.get("prop_list") or [])
+            samples = []
+            for row in body.get("data") or []:
+                v = dict(zip(cols, row))
+                g = lambda k: (float(v[names[k]]) if v.get(names[k]) is not None else None)  # noqa: E731
+                # VMS returns bandwidth in bytes/s and latency in microseconds
+                samples.append({"t": v.get("timestamp"), "rd_bw": g("rd_bw"), "wr_bw": g("wr_bw"), "rd_iops": g("rd_iops"),
+                                "wr_iops": g("wr_iops"), "rd_lat": g("rd_latency"), "wr_lat": g("wr_latency")})
+            if samples:
+                out["runs"][run_id] = sorted(samples, key=lambda x: str(x["t"]))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
 
 
 @app.post("/api/reports/performance")
-def performance_report(body: PerfReportIn) -> dict:
+async def performance_report(body: PerfReportIn) -> dict:
     """Build a PowerPoint performance report from elbencho runs; it lands in the results folder / 🗒 Logs tab."""
     import re
     from . import perf_report
@@ -1893,25 +2129,47 @@ def performance_report(body: PerfReportIn) -> dict:
             runs.append(json.loads((results.RESULTS_DIR / f"{i}.json").read_text()))
         except (OSError, ValueError) as e:
             raise HTTPException(400, f"Can't read {i}.json: {e}")
+    expected = _save_expected(body.expected) if body.expected is not None else get_expected()
+    labels = _save_labels(body.labels) if body.labels is not None else get_labels()
     tenant = dict(runs[-1].get("vars") or {})
     tenant.update({k: v for k, v in (state.vars or {}).items() if k in ("tenant_name", "view_path") and v and not tenant.get(k)})
     mount = dict(state.cfg.get("mount") or {})
+    rec = next((t for t in reversed(state.tenants.load()) if t.get("name") == tenant.get("tenant_name")), None) if state.tenants else None
     ips = state.provisioner.vip_ips() if state.provisioner else []
     if not ips:
-        rec = next((t for t in reversed(state.tenants.load()) if t.get("name") == tenant.get("tenant_name")), None) if state.tenants else None
         ips = list(((rec or {}).get("vip_pool") or {}).get("ips") or [])
     if mount.get("options") and ips:   # show the real VIPs instead of ${tenant_vip.start}-${tenant_vip.end}
         mount["options"] = re.sub(r"\$\{tenant_vip\.start\}", ips[0], re.sub(r"\$\{tenant_vip\.end\}", ips[-1], str(mount["options"])))
     clients = [{"name": c["name"], "host": c["host"], "username": c.get("username", state.cfg["ssh"].get("username"))}
                for c in state.cfg.get("clients", [])]
+    pool_name = ((rec or {}).get("vip_pool") or {}).get("name") or tenant.get("vip_pool_name")
+    arch = {"vip_pool": {"name": pool_name, "ips": ips}, "view_path": tenant.get("view_path") or ((rec or {}).get("view") or {}).get("path"),
+            "protocols": tenant.get("view_protocols") or ((rec or {}).get("view") or {}).get("protocols")}
+    cluster = await _cluster_for_report(perf_report.run_windows(runs)) if body.cluster_metrics else {"info": {}, "runs": {}}
+    formats = [f for f in ("pptx", "docx") if f in (body.formats or [])]
+    if not formats:
+        raise HTTPException(400, "Pick PowerPoint, Word or both")
     out = perf_report.report_path(results.RESULTS_DIR)
+    common = dict(site=sites.info(state.site)["name"] if state.site else "Test site", unit=body.unit.upper(),
+                  vms=str(state.cfg["vms"].get("url", "")).rstrip("/"), tenant=tenant, clients=clients, mount=mount,
+                  version=APP_VERSION, expected=expected, cluster=cluster, arch=arch, labels=labels)
+    files, res = [], {}
     try:
-        res = perf_report.build(runs, out, site=sites.info(state.site)["name"] if state.site else "Test site",
-                                unit=body.unit.upper(), vms=str(state.cfg["vms"].get("url", "")).rstrip("/"),
-                                tenant=tenant, clients=clients, mount=mount, version=APP_VERSION)
+        if "pptx" in formats:
+            res = perf_report.build(runs, out, **common)
+            files.append(out.name)
+        if "docx" in formats:
+            from . import word_report
+            tpl = state.site / sites.REPORT_TEMPLATE if state.site else None
+            wres = word_report.build(runs, out.with_suffix(".docx"), template=tpl.read_bytes() if tpl and tpl.is_file() else None,
+                                     **common)
+            files.append(wres["file"])
+            res = {**wres, **res, "word_template": wres["template"]}
+            if not out.with_suffix(".md").exists():
+                word_report.write_summary(runs, out.with_suffix(".md"), **common)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    return {**res, "log_id": out.stem}
+    return {**res, "files": files, "log_id": out.stem, "cluster_runs": len(cluster["runs"]), "expected": expected}
 
 
 @app.get("/api/results")

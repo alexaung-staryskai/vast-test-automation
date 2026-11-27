@@ -30,6 +30,20 @@ Bump it with every change you push: **major** for changes that break existing si
   per-client throughput, all results, test setup), in the tester manual's template. Saved in results and listed in
   🗒 Logs with a download button. Needs `python-pptx` (added to requirements.txt; installed on the next start).
 
+- Performance report: **Test Architecture**, **Estimated vs Actual** (targets typed in the report window, saved per site),
+  **Cluster Performance** (VMS analytics per run window), **Latency** (P50 / P99 / P99.9 from elbencho `--lat --latpercent`);
+  Throughput per Run shows time taken and P99 latency. Failed runs are not ticked by default.
+- Performance report page 2: **Cluster Network Architecture** drawn from the VMS inventory - split (CNodes + DBoxes,
+  front-end and back-end switches) or converged (EBoxes) - with counts, DBox model and link speeds; switch names typed
+  in the report window.
+
+- **⤓ Export configuration / ⤒ Import site**: a site's whole configuration (config.yaml, site.yaml, tenants.yaml,
+  optionally saved passwords and onboarding state) as a .zip without logs; import creates a new site.
+
+- **Word performance report** (with or instead of PowerPoint), laid out like the usual VAST benchmark write-ups, on a
+  **report template** uploaded in ⚙ Configuration (logo, header / footer, styles, `{{placeholders}}`, `{{content}}`);
+  starter template to download. Needs `python-docx` and `matplotlib` (installed on the next start).
+
 ## 1.3.0
 - **Delete site** removes the tenant and everything under it from the VMS, in dependency order, in a 4-step modal.
 - **Force delete tenant** when the VMS refuses because files are left (type `force delete <tenant>`).

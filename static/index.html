@@ -47,6 +47,8 @@
       <div class="card-head">
         <div><h2>Test sites</h2><span class="muted small" id="sitesDir"></span></div>
         <div class="btn-row"><button class="btn" id="siteLogBtn" title="Every test-site deletion: what was deleted on the VMS, failures and force deletes">🗒 Delete log</button>
+        <button class="btn" id="siteImportBtn" title="Create a test site from an exported site .zip (configuration only - logs are not imported)">⤒ Import site</button>
+        <input type="file" id="siteImportFile" accept=".zip,application/zip" hidden>
         <button class="btn primary" id="siteNewBtn">＋ New Test Site</button></div>
       </div>
       <p class="muted small">A test site is a folder that holds everything for one test: configuration, onboarded tenants and results.
@@ -261,7 +263,7 @@
             <option value="MB">MB/s</option><option value="GB">GB/s</option><option value="TB">TB/s</option>
           </select>
           <button class="btn" id="perfCsv" title="Download this run's results as CSV, in the chosen unit">⤓ CSV</button>
-          <button class="btn primary" id="perfReport" title="Build a PowerPoint performance report from the runs you pick; it is saved in 🗒 Logs">📊 PowerPoint report</button>
+          <button class="btn primary" id="perfReport" title="Build a PowerPoint and / or Word performance report from the runs you pick; it is saved in 🗒 Logs">📊 Performance report</button>
           <button class="btn ghost" id="refreshResults">↻ Refresh</button>
         </div>
       </div>
@@ -315,7 +317,7 @@
         <div><h2>Logs</h2><div class="muted small" id="logsInfo"></div></div>
         <div class="btn-row">
           <button class="btn ghost" id="logsRefresh">↻ Refresh</button>
-          <button class="btn" id="logsReport" title="Build a PowerPoint performance report from the site's performance runs">📊 Performance report</button>
+          <button class="btn" id="logsReport" title="Build a PowerPoint and / or Word performance report from the site's performance runs">📊 Performance report</button>
           <button class="btn" id="logsArchive" title="Zip the logs into results/archive/ and remove them from this list">🗄 Archive logs</button>
           <button class="btn danger" id="logsPurge" title="Delete the logs permanently">🗑 Purge logs</button>
         </div>
@@ -367,6 +369,31 @@
     <section class="card" id="cfgYamlCard" hidden>
       <textarea id="cfgYaml" class="yaml" spellcheck="false"></textarea>
     </section>
+    <section class="card" id="rtCard">
+      <div class="card-head">
+        <div><h2>📄 Report template (Word)</h2>
+          <div class="muted small">Used for the Word performance report - your logo, header / footer, fonts and heading styles</div></div>
+        <div class="btn-row">
+          <button class="btn primary" id="rtUpload" title="Upload a .docx or .dotx">⤒ Upload template</button>
+          <input type="file" id="rtFile" accept=".docx,.dotx" hidden>
+          <a class="btn" id="rtDownload" href="/api/reports/word-template/file" hidden>⤓ Current template</a>
+          <a class="btn ghost" href="/api/reports/word-template/starter" title="A template to edit in Word: placeholders and where the report goes">⤓ Starter template</a>
+          <button class="btn ghost danger" id="rtRemove" hidden>Remove</button>
+        </div>
+      </div>
+      <div id="rtStatus" class="small"></div>
+      <details class="small rt-help"><summary class="muted">How the template is used</summary>
+        <ul>
+          <li>Kept from your file: page size and margins, header and footer (logo), fonts, colours and the styles
+            <code>Title</code>, <code>Heading 1</code>, <code>Heading 2</code>, <code>List Bullet</code>, <code>Table Grid</code>.</li>
+          <li>Placeholders filled in anywhere, headers and footers included: <code>{{title}}</code> <code>{{site}}</code>
+            <code>{{tenant}}</code> <code>{{date}}</code> <code>{{author}}</code> <code>{{vms}}</code> <code>{{period}}</code>.</li>
+          <li>A paragraph holding only <code>{{content}}</code> is where the report goes - a cover page before it and an appendix
+            after it are kept. Without it, the template's own text is replaced by the report.</li>
+          <li>Saved in this site's folder and included in <b>⤓ Export configuration</b>.</li>
+        </ul></details>
+    </section>
+
     <section class="card collapsible" id="ccCard">
       <div class="card-head">
         <h2><button type="button" class="collapse-toggle" aria-expanded="true" aria-controls="ccCard" title="Hide / show this section"><span class="chev" aria-hidden="true">▾</span> Custom Linux commands</button></h2>

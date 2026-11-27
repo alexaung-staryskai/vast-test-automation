@@ -114,6 +114,7 @@ function showTab(id) {
   if (id === "t2") consoles.forEach((c) => c.fit());
   if (id === "t3" && !cfgEdit.loaded) loadRawConfig();
   if (id === "t3" && !cc.loaded) loadCustomCmds();
+  if (id === "t3") loadReportTemplate();
   if (id === "t0") renderSites();
   if (id === "t5") { loadResults(); requestAnimationFrame(fitLogsSplit); }
   if (id === "t6" && typeof openChartTab === "function") openChartTab();
@@ -1526,6 +1527,7 @@ $("#perfCsv").onclick = () => {
 };
 
 /* 📊 PowerPoint performance report: pick runs and unit → the server builds the deck → it is listed in 🗒 Logs */
+let prFormats = (store.get("reportFormats") || "pptx").split(",");
 async function perfReportModal() {
   const d = await api("GET", "/api/logs").catch((e) => { toast(e.message); return null; });
   if (!d) return;
@@ -1533,19 +1535,50 @@ async function perfReportModal() {
   const runs = d.logs.filter((l) => l.performance && l.type !== "report" && l.files.some((f) => f.name.endsWith(".json")));
   if (!runs.length) return toast("No performance runs yet - run Elbencho Write / Read on the consoles first.");
   const unit = ["MB", "GB", "TB"].includes(perfUnit()) ? perfUnit() : "GB";
+  const exp = await api("GET", "/api/reports/expected").catch(() => ({}));
+  const ev = (k) => (exp[k] ?? "") === "" ? "" : esc(String(exp[k]));
+  const labs = await api("GET", "/api/reports/labels").catch(() => ({}));
+  const lv = (k) => esc(String(labs[k] ?? ""));
   const wrap = document.createElement("div");
   wrap.className = "modal-backdrop ds-backdrop";
   wrap.innerHTML = `<div class="modal ds-modal vf-modal pr-modal" role="dialog" aria-modal="true" aria-labelledby="prTitle">
-    <div class="ds-head"><h3 id="prTitle">📊 Performance report (PowerPoint)</h3>
+    <div class="ds-head"><h3 id="prTitle">📊 Performance report</h3>
       <button class="btn ghost sm ds-x" title="Close (Esc)" aria-label="Close">✕</button></div>
     <div class="ds-body">
-      <p class="small muted">Charts and tables of the runs you pick, in the same template as the tester manual. Throughput is summed across clients.
+      <p class="small muted">Charts and tables of the runs you pick - PowerPoint in the tester manual's template, Word in your report template. Throughput is summed across clients.
         The report is saved in this site's results and listed in <b>🗒 Logs</b>.</p>
-      <div class="pr-tools small"><label><input type="checkbox" class="pr-all" checked> All runs</label>
+      <div class="pr-tools small pr-formats"><b>Format</b>
+        <label><input type="checkbox" class="pr-fmt" value="pptx" ${prFormats.includes("pptx") ? "checked" : ""}> 📊 PowerPoint</label>
+        <label><input type="checkbox" class="pr-fmt" value="docx" ${prFormats.includes("docx") ? "checked" : ""}> 📄 Word</label>
+        <span class="muted">Word uses the template from ⚙ Configuration → Report template</span></div>
+      <div class="pr-tools small"><label><input type="checkbox" class="pr-all"> All runs</label>
+        ${runs.some((l) => l.status === "failed") ? '<span class="muted">failed runs are not ticked</span>' : ""}
         <label>Unit <select class="pr-unit">${["MB", "GB", "TB"].map((u) => `<option ${u === unit ? "selected" : ""}>${u}</option>`).join("")}</select> /s</label></div>
-      <div class="pr-runs">${runs.map((l) => `<label class="pr-run"><input type="checkbox" value="${esc(l.id)}" checked>
+      <div class="pr-runs">${runs.map((l) => `<label class="pr-run"><input type="checkbox" value="${esc(l.id)}" ${l.status === "failed" ? "" : "checked"}>
         <span><b>${esc(l.label)}</b> <span class="pill ${esc(l.status)}">${esc(l.status)}</span>
         <span class="muted small">${esc(new Date(l.time || l.mtime * 1000).toLocaleString())} · ${esc(l.clients.filter(Boolean).join(", "))}</span></span></label>`).join("")}</div>
+      <details class="pr-exp" ${Object.keys(exp).length ? "open" : ""}>
+        <summary><b>Expected performance</b> <span class="muted small">- for the Estimated vs Actual page; leave empty to skip it · saved for this site</span></summary>
+        <div class="pr-exp-grid">
+          <label>Read GB/s<input data-e="read_gbps" inputmode="decimal" value="${ev("read_gbps")}" placeholder="e.g. 45"></label>
+          <label>Write GB/s<input data-e="write_gbps" inputmode="decimal" value="${ev("write_gbps")}" placeholder="e.g. 20"></label>
+          <label>Read IOPS<input data-e="read_iops" inputmode="numeric" value="${ev("read_iops")}" placeholder="optional"></label>
+          <label>Write IOPS<input data-e="write_iops" inputmode="numeric" value="${ev("write_iops")}" placeholder="optional"></label>
+          <label>P99 latency ms<input data-e="p99_ms" inputmode="decimal" value="${ev("p99_ms")}" placeholder="e.g. 4"></label>
+          <label class="pr-basis">Where the numbers come from<input data-e="basis" value="${ev("basis")}" placeholder="e.g. VAST sizing for 3 CNodes, POC success criteria"></label>
+        </div>
+      </details>
+      <details class="pr-exp" ${Object.keys(labs).length ? "open" : ""}>
+        <summary><b>Labels</b> <span class="muted small">- optional: switch and DBox names for the network diagram (counts and speeds come from the VMS), report author · saved for this site</span></summary>
+        <div class="pr-exp-grid">
+          <label>Front-end switch<input data-l="front_switch" value="${lv("front_switch")}" placeholder="e.g. Spectrum 200G"></label>
+          <label>Back-end switch<input data-l="back_switch" value="${lv("back_switch")}" placeholder="e.g. Spectrum 200G"></label>
+          <label>DBox model<input data-l="dbox_model" value="${lv("dbox_model")}" placeholder="e.g. Ceres 338"></label>
+          <label>Author<input data-l="author" value="${lv("author")}" placeholder="for the Word report"></label>
+        </div>
+      </details>
+      <label class="small pr-cl"><input type="checkbox" class="pr-cluster" checked> Add the cluster's own numbers from the VMS
+        <span class="muted">(Network Architecture, Data Path and Cluster Performance pages - read-only)</span></label>
       <div class="pr-out"></div>
     </div>
     <div class="btn-row modal-actions ds-actions"></div></div>`;
@@ -1558,14 +1591,18 @@ async function perfReportModal() {
   document.addEventListener("keydown", onKey);
   document.body.appendChild(wrap);
   const boxes = () => [...body.querySelectorAll(".pr-run input")];
+  const fmts = () => [...body.querySelectorAll(".pr-fmt:checked")].map((b) => b.value);
   const sync = () => {
     const n = boxes().filter((b) => b.checked).length;
+    const f = fmts();
     body.querySelector(".pr-all").checked = n === boxes().length;
-    acts.querySelector('[data-a="go"]').disabled = !n;
-    acts.querySelector('[data-a="go"]').textContent = `📊 Generate report (${n} run${n === 1 ? "" : "s"})`;
+    acts.querySelector('[data-a="go"]').disabled = !n || !f.length;
+    acts.querySelector('[data-a="go"]').textContent = `${f.length === 1 && f[0] === "docx" ? "📄" : "📊"} Generate ${
+      f.length === 2 ? "PowerPoint + Word" : f[0] === "docx" ? "Word report" : "PowerPoint"} (${n} run${n === 1 ? "" : "s"})`;
   };
   body.querySelector(".pr-all").onchange = (e) => { boxes().forEach((b) => (b.checked = e.target.checked)); sync(); };
   body.querySelector(".pr-runs").onchange = sync;
+  body.querySelector(".pr-formats").onchange = () => { prFormats = fmts(); store.set("reportFormats", prFormats.join(",")); sync(); };
   acts.innerHTML = `<button class="btn ghost" data-a="cancel">Cancel</button><button class="btn primary" data-a="go"></button>`;
   sync();
   acts.onclick = async (e) => {
@@ -1576,13 +1613,17 @@ async function perfReportModal() {
     busyNow = true;
     wrap.querySelector(".ds-x").hidden = true;
     acts.querySelectorAll("button").forEach((b) => (b.disabled = true));
-    out.innerHTML = `<div class="ds-now small"><span class="ds-spin sm"></span> Building the PowerPoint - charts, tables and test setup…</div>`;
+    out.innerHTML = `<div class="ds-now small"><span class="ds-spin sm"></span> Building the PowerPoint - reading cluster figures from the VMS, charts, tables…</div>`;
     try {
-      const r = await api("POST", "/api/reports/performance", { runs: boxes().filter((b) => b.checked).map((b) => b.value), unit: body.querySelector(".pr-unit").value });
+      const expected = Object.fromEntries([...body.querySelectorAll("[data-e]")].map((i) => [i.dataset.e, i.value.trim()]));
+      const r = await api("POST", "/api/reports/performance", { runs: boxes().filter((b) => b.checked).map((b) => b.value),
+        unit: body.querySelector(".pr-unit").value, expected, cluster_metrics: body.querySelector(".pr-cluster").checked, formats: fmts(),
+        labels: Object.fromEntries([...body.querySelectorAll("[data-l]")].map((i) => [i.dataset.l, i.value.trim()])) });
       out.innerHTML = `<div class="pr-done"><svg class="ds-check vf-check" viewBox="0 0 52 52" aria-hidden="true"><circle cx="26" cy="26" r="24"/><path d="M15 27 l8 8 l15 -17"/></svg>
-        <div><b>Report ready</b> - ${r.slides} slides from ${r.runs} run${r.runs === 1 ? "" : "s"}<div class="mono small">${esc(r.file)}</div></div></div>`;
+        <div><b>Report ready</b> - ${r.runs} run${r.runs === 1 ? "" : "s"}${r.slides ? ` · PowerPoint ${r.slides} slides` : ""}${r.word_template ? ` · Word (${r.word_template === "uploaded" ? "your template" : "built-in layout"})` : ""}${body.querySelector(".pr-cluster").checked
+          ? ` · cluster figures for ${r.cluster_runs} run${r.cluster_runs === 1 ? "" : "s"}` : ""}<div class="mono small">${r.files.map(esc).join(" · ")}</div></div></div>`;
       acts.innerHTML = `<button class="btn ghost" data-a="logs" data-id="${esc(r.log_id)}">🗒 Open in Logs</button>
-        <a class="btn primary" href="/api/results/${encodeURIComponent(r.file)}" download>⤓ Download PowerPoint</a>
+        ${r.files.map((f) => `<a class="btn primary" href="/api/results/${encodeURIComponent(f)}" download>⤓ ${f.endsWith(".docx") ? "Word" : "PowerPoint"}</a>`).join("")}
         <button class="btn ghost" data-a="close">Close</button>`;
       loadResults();   // the new report appears in 🗒 Logs and in Performance result files
     } catch (err) {
@@ -1667,7 +1708,7 @@ async function showLog() {
   const box = $("#logView");
   const l = logData.logs.find((x) => x.id === logSel.id);
   if (!l) { box.className = "logview-empty muted"; box.textContent = "Select a log on the left to read it here."; return; }
-  const pref = ["txt", "md", "json", "pptx"];
+  const pref = ["txt", "md", "json", "pptx", "docx"];
   const file = l.files.find((f) => f.name === logSel.file) || [...l.files].sort((a, b) => pref.indexOf(a.name.split(".").pop()) - pref.indexOf(b.name.split(".").pop()))[0];
   logSel.file = file.name;
   const ext = file.name.split(".").pop();
@@ -1683,10 +1724,11 @@ async function showLog() {
       </div></div>
     <pre class="lv-body ${ext}"><span class="muted">Loading ${esc(file.name)}…</span></pre>`;
   const token = ++logViewToken;
-  if (ext === "pptx") {   // a PowerPoint report: a download panel instead of text
-    $(".lv-body", box).outerHTML = `<div class="lv-pptx"><div class="lv-pptx-icon" aria-hidden="true">📊</div>
-      <div><b>${esc(file.name)}</b><div class="muted small">PowerPoint · ${fmtSize(file.size)}</div>
-      <a class="btn primary" href="/api/results/${encodeURIComponent(file.name)}" download>⤓ Download PowerPoint</a>
+  if (ext === "pptx" || ext === "docx") {   // a report: a download panel instead of text
+    const kind = ext === "docx" ? "Word" : "PowerPoint";
+    $(".lv-body", box).outerHTML = `<div class="lv-pptx"><div class="lv-pptx-icon" aria-hidden="true">${ext === "docx" ? "📄" : "📊"}</div>
+      <div><b>${esc(file.name)}</b><div class="muted small">${kind} · ${fmtSize(file.size)}</div>
+      <a class="btn primary" href="/api/results/${encodeURIComponent(file.name)}" download>⤓ Download ${kind}</a>
       ${l.files.some((f) => f.name.endsWith(".md")) ? `<div class="small muted">The <b>md</b> button shows the report's summary table.</div>` : ""}</div></div>`;
     $("#lvCopy", box).hidden = true;
     return;
@@ -2169,6 +2211,47 @@ window.addEventListener("beforeunload", (e) => { if (cfgEdit.dirty) { e.preventD
 const cc = { loaded: false, list: [], mtime: null, dirty: false };
 function ccSetDirty(v) { cc.dirty = v; $("#ccDirty").hidden = !v; }
 function ccMsg(html, cls = "") { $("#ccMsg").innerHTML = html ? `<span class="${cls}">${html}</span>` : ""; }
+/* 📄 Report template (Word): upload / download / remove, and what the report will take from it */
+async function loadReportTemplate(info) {
+  const t = info || await api("GET", "/api/reports/word-template").catch(() => null);
+  if (!t) return;
+  $("#rtDownload").hidden = $("#rtRemove").hidden = !t.exists;
+  if (!t.exists) {
+    $("#rtStatus").innerHTML = `<span class="pill">built-in</span> No template uploaded - the Word report uses a plain built-in layout.
+      Start from <b>⤓ Starter template</b> or upload your company's .docx.`;
+    return;
+  }
+  const bits = [];
+  if (t.error) bits.push(`<span class="err">${esc(t.error)}</span>`);
+  if (t.header_images) bits.push(`logo in the header`);
+  bits.push(t.content_marker ? "report goes at <code>{{content}}</code>" : "template text is replaced by the report");
+  if (t.placeholders?.length) bits.push(`placeholders: ${t.placeholders.map((x) => `<code>{{${esc(x)}}}</code>`).join(" ")}`);
+  if (t.missing_styles?.length) bits.push(`<span class="warn-note">missing styles ${t.missing_styles.map(esc).join(", ")} - plain formatting is used</span>`);
+  $("#rtStatus").innerHTML = `<span class="pill passed">uploaded</span> <b>${esc(t.name)}</b>
+    <span class="muted">· ${fmtSize(t.size)}${t.page ? " · " + esc(t.page) : ""}${t.uploaded_at ? " · " + esc(fmtDate(t.uploaded_at)) : ""}</span>
+    <div class="muted" style="margin-top:4px">${bits.join(" · ")}</div>`;
+}
+$("#rtUpload").onclick = () => { $("#rtFile").value = ""; $("#rtFile").click(); };
+$("#rtFile").onchange = async (e) => {
+  const f = e.target.files?.[0];
+  if (!f) return;
+  $("#rtStatus").innerHTML = `<span class="muted"><span class="ds-spin sm"></span> Checking ${esc(f.name)}…</span>`;
+  try {
+    const r = await fetch(`/api/reports/word-template?filename=${encodeURIComponent(f.name)}`, { method: "PUT", body: f });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(typeof d.detail === "string" ? d.detail : `HTTP ${r.status}`);
+    loadReportTemplate(d);
+    toast(`Template “${f.name}” saved - the next Word report uses it.`, "ok", 4000);
+  } catch (err) {
+    $("#rtStatus").innerHTML = `<span class="err">Not uploaded: ${esc(err.message)}</span>`;
+  }
+};
+$("#rtRemove").onclick = async (e) => {
+  if (!(await uiConfirm({ title: "Remove the report template?", ok: "Remove", danger: true,
+    html: "<p>The Word report goes back to the built-in layout. Reports already generated are not changed.</p>" }))) return;
+  busy(e.target, async () => loadReportTemplate(await api("DELETE", "/api/reports/word-template")));
+};
+
 async function loadCustomCmds() {
   const r = await api("GET", "/api/custom-commands");
   cc.loaded = true; cc.mtime = r.mtime; cc.list = r.commands;
@@ -2334,8 +2417,8 @@ async function renderSites() {
       <div class="card-head"><div><h2>📁 ${esc(cur.name)} <span class="pill passed">open</span></h2>
           <div class="muted small">${cur.description ? esc(cur.description) : "no description"}</div></div>
         <div class="btn-row">
-          <a class="btn" href="/api/sites/export" title="Configuration, tenants and results">⤓ Download site (.zip)</a>
-          <a class="btn ghost" href="/api/sites/export?include_results=false">⤓ Without results</a></div></div>
+          <button class="btn" data-export="${esc(cur.path)}" data-name="${esc(cur.name)}" title="All of this site's configuration, without logs - to import it on another computer">⤓ Export configuration</button>
+          <a class="btn ghost" href="/api/sites/export" title="Configuration, tenants and all results / logs">⤓ Download with results</a></div></div>
       <div class="sitegrid">
         <div class="tbox"><h3>Site</h3><div class="kv small">
           <b>Folder</b><span class="mono">${esc(cur.path)}${copyBtn(cur.path)}</span>
@@ -2355,11 +2438,11 @@ async function renderSites() {
             <div><button class="btn" type="submit">Save</button> <span id="siteMetaMsg" class="small"></span></div>
           </form></div>
         <div class="tbox"><h3>Replicate on another machine</h3><ol class="small howto">
-          <li>Download the zip (or copy the folder) and send it.</li>
-          <li>On the other laptop, unzip it next to VAST Test Bench.</li>
-          <li>Start it on that folder: <div class="codeline"><code>${esc(runCmd)}</code>${copyBtn(runCmd)}</div>
-            or use <b>Open from a folder</b> below.</li></ol>
-          <div class="small muted">The zip leaves out backups and the hidden run state (generated secrets). config.yaml is included as it is, so use <code>\${env:…}</code> references for tokens and passwords you don't want to share.</div></div>
+          <li><b>⤓ Export configuration</b> (top right) - the whole configuration without logs; tick the box to include saved passwords.</li>
+          <li>Send the .zip.</li>
+          <li>On the other computer: Test site tab → <b>⤒ Import site</b> → choose the .zip → Open site.</li></ol>
+          <div class="small muted">config.yaml is exported as it is, so keep tokens and passwords you don't want to share as <code>\${env:…}</code> references.
+            Or copy the whole folder and start it with <span class="codeline"><code>${esc(runCmd)}</code>${copyBtn(runCmd)}</span></div></div>
       </div></section>`;
     $("#siteMeta").onsubmit = async (e) => {
       e.preventDefault();
@@ -2406,6 +2489,7 @@ async function renderSites() {
           <td class="mono small folder" title="${esc(s.path)}">${esc(s.path.split("/").slice(-2).join("/"))}</td>
           <td class="acts">${isCur ? `<button class="btn sm" disabled>Opened</button>`
             : `<button class="btn sm ${s.path === siteData.last ? "primary" : ""}" data-open="${esc(s.path)}">Open site</button>`}
+            <button class="btn sm ghost" data-export="${esc(s.path)}" data-name="${esc(s.name)}" title="Export this site's configuration (no logs)">⤓ Config</button>
             ${s.status === "vms record deleted" ? `<button class="btn sm ghost" data-del="${esc(s.path)}" data-name="${esc(s.name)}"
               title="Look on the VMS for anything the earlier delete left behind (e.g. the tenant's local provider) and delete it">🧹 Check VMS for leftovers</button>` : `<button class="btn sm ghost danger" data-del="${esc(s.path)}" data-name="${esc(s.name)}"
               title="Delete the tenant and its assets from the VMS. The site's local records and test results are kept.">Delete site</button>`}</td>
@@ -2472,6 +2556,51 @@ function showCreatePanel(show) {
 }
 $("#siteNewBtn").onclick = () => showCreatePanel(true);
 $("#siteLogBtn").onclick = () => showDeleteLog();
+
+/* ---- ⤓ Export configuration / ⤒ Import site: a site's whole configuration without its logs ---- */
+async function exportSiteModal(path, name) {
+  exportSecretsChoice = false;   // never carried over from an earlier export
+  const ok = await uiConfirm({ title: `⤓ Export configuration - ${name}`, ok: "⤓ Download .zip", wide: false,
+    html: `<p>Everything that configures this site, <b>without logs or test results</b>:</p>
+      <ul class="small rs-list"><li><code>config.yaml</code> - VMS connection, onboarding settings, VIP pool, SSH clients, presets,
+        custom Linux commands, report targets and diagram labels</li>
+        <li><code>site.yaml</code> - name, description, status</li><li><code>tenants.yaml</code> - onboarded tenants</li></ul>
+      <label class="ds-warn small"><input type="checkbox" id="expSecrets">
+        <span>Also include the saved passwords - SSH client passwords, tenant admin password, S3 keys - and the onboarding state.
+        <b>Anyone with the zip can read them.</b></span></label>
+      <p class="small muted">Import it on another computer with <b>⤒ Import site</b> (Test site tab).</p>` });
+  if (!ok) return;
+  location.href = `/api/sites/export-config?path=${encodeURIComponent(path)}&include_secrets=${exportSecretsChoice ? "true" : "false"}`;
+}
+let exportSecretsChoice = false;
+document.addEventListener("change", (e) => { if (e.target.id === "expSecrets") exportSecretsChoice = e.target.checked; });
+$("#siteCurrent").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-export]");
+  if (b) exportSiteModal(b.dataset.export, b.dataset.name);
+});
+$("#siteImportBtn").onclick = () => { $("#siteImportFile").value = ""; $("#siteImportFile").click(); };
+$("#siteImportFile").onchange = async (e) => {
+  const f = e.target.files?.[0];
+  if (!f) return;
+  const msg = $("#siteListMsg");
+  msg.innerHTML = `<span class="muted"><span class="ds-spin sm"></span> Importing ${esc(f.name)}…</span>`;
+  try {
+    const r = await fetch(`/api/sites/import?filename=${encodeURIComponent(f.name)}`, { method: "POST", headers: { "Content-Type": "application/zip" }, body: f });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(typeof d.detail === "string" ? d.detail : `HTTP ${r.status}`);
+    msg.innerHTML = "";
+    siteTab = "active"; store.set("siteTab", "active");
+    await renderSites();
+    const open = await uiConfirm({ title: `⤒ Imported “${d.name}”`, ok: "Open site", cancel: "Close",
+      html: `<p>New test site <b>${esc(d.name)}</b>${d.renamed ? " (renamed - a site with that name already exists)" : ""}.</p>
+        <p class="small">Imported: ${d.files.map((x) => `<code>${esc(x)}</code>`).join(" ")}</p>
+        ${d.skipped.length ? `<p class="small muted">Not imported (logs, results, backups): ${d.skipped.length} file${d.skipped.length === 1 ? "" : "s"}.</p>` : ""}
+        ${d.includes_secrets ? "" : `<p class="small muted">No saved passwords were in the zip - enter SSH passwords with ✎ Edit on the Clients tab, or use \${env:…} values.</p>`}` });
+    if (open) openSite({ path: d.path }, msg);
+  } catch (err) {
+    msg.innerHTML = `<span class="err">Import failed: ${esc(err.message)}</span>`;
+  }
+};
 const onSiteTab = (e) => {
   const b = e.target.closest("[data-sitetab]");
   if (!b || b.dataset.sitetab === siteTab) return;
@@ -2501,6 +2630,7 @@ function vmsReminder(tenants) {
 $("#siteList").addEventListener("click", async (e) => {
   const b = e.target;
   if (b.dataset.open) return openSite({ path: b.dataset.open }, $("#siteListMsg"));
+  if (b.dataset.export) return exportSiteModal(b.dataset.export, b.dataset.name);
   if (b.dataset.del) {
     const site = siteData.sites.find((s) => s.path === b.dataset.del) || { name: b.dataset.name, path: b.dataset.del, active_tenants: [] };
     deleteSiteModal(site);

@@ -138,12 +138,55 @@ run.bat dev\mock-site
 
 The mock SSH servers only echo commands (and fake elbencho output). Nothing runs on your laptop.
 
-## Performance report (PowerPoint)
+## Export and import a site's configuration
 
-**📊 PowerPoint report** (Performance results card, tab ②) or **📊 Performance report** (🗒 Logs) builds a deck from the
-performance runs you pick: highlights (peak read / write throughput, peak IOPS), throughput and IOPS per run, throughput
-per client, a table of every elbencho phase, and the test setup (tenant, clients, mount options with the real VIPs,
-elbencho commands). Numbers are the same as the Performance results table: summed across clients, decimal units
+**⤓ Export configuration** (open site card, or **⤓ Config** on any row of the site list) downloads a .zip with everything
+that configures the site - **without logs or test results**:
+
+- `config.yaml` - VMS connection, onboarding settings, VIP pool, SSH clients, presets, custom Linux commands,
+  report targets and diagram labels
+- `site.yaml` - name, description, status (local paths are removed)
+- `tenants.yaml` - onboarded tenants
+- optional (tick the box): saved passwords - `.client-secrets.json`, `.tenant-secrets.json` - and the onboarding state
+
+**⤒ Import site** (Test site tab) creates a **new** test site from such a zip; it never overwrites a site (a name that is
+taken gets `-2`, `-3` …). It also accepts a full **Download with results** zip and skips the logs in it. The zip is
+checked first: one site per zip, no paths outside the site folder, a valid config.yaml. Imported password files are
+readable by the owner only (mode 600).
+
+## Performance report (PowerPoint and Word)
+
+**📊 Performance report** (Performance results card, tab ②, or 🗒 Logs) builds a **PowerPoint** deck, a **Word** document
+or both from the performance runs you pick (elbencho read and write results only). The Word report follows the usual
+benchmark write-up: document history, overview (objective / method / test tool), lab environment table, network
+architecture, data path and sample mount command, result summary, estimated vs actual, results per run (First / Last
+Done MiB/s, GB/s, elapsed), per-client throughput, latency, cluster performance, execution commands, observations and a
+disclaimer; charts are images. It uses the **report template** uploaded in ⚙ Configuration → Report template (.docx or
+.dotx; kept per site and included in Export configuration): its page setup, header / footer and logo, fonts and the styles
+Title, Heading 1, Heading 2, List Bullet and Table Grid. Placeholders `{{title}} {{site}} {{tenant}} {{date}} {{author}}
+{{vms}} {{period}}` are filled in anywhere; a paragraph holding only `{{content}}` marks where the report goes (a cover page
+before it is kept). **⤓ Starter template** gives a template to edit in Word. Without an upload a plain built-in layout is used.
+
+The PowerPoint deck contains:
+
+- **Cluster Network Architecture** (page 2) - drawn from the VMS inventory (`/cboxes/`, `/cnodes/`, `/dboxes/`,
+  `/dnodes/`, `/eboxes/`, `/nics/`): split design = clients → 2 front-end switches → CNodes → 2 back-end switches → DBoxes,
+  converged design = clients → 2 switches → EBoxes; red / blue = fabric A / B, dashed = back-end, with box counts, the
+  DBox model and per-node port speeds. The VMS doesn't list switches, so their names (and an optional DBox model name)
+  are typed in the report window and saved per site under `report.labels`.
+- **Test Data Path** - clients → NFS mount (protocol, nconnect, multipath) → VIP pool → VAST cluster (name, VAST OS,
+  CNodes / DBoxes), tenant, view, QoS and quota.
+- **Performance Highlights** - peak read / write throughput, peak IOPS, P99 latency.
+- **Estimated vs Actual** - the expected figures you type in the report window (read / write GB/s, IOPS, P99 latency and
+  where they come from; saved per site under `report.expected` in config.yaml) against the measured results, with % of target.
+- **Throughput per Run** - chart plus time taken, IOPS, average / P99 / P99.9 latency per run.
+- **Cluster Performance** - what the VAST cluster served during each run, from the VMS analytics API
+  (`GET /monitors/ad_hoc_query/`, cluster `ProtoCommon` bandwidth / IOPS / latency, 10-second samples): whole-run average
+  (comparable with the clients' figure), sustained and peak, with notes on slow phases or large differences.
+- **Latency** - P50 / P99 / P99.9 per run and min / avg / percentiles / max per client. Needs elbencho with
+  `--lat --latpercent` (add `--latpercent9s 1` for P99.9) in the preset.
+- IOPS per run, throughput per client, all results, and the test setup (tenant, clients, mount options with the real VIPs,
+  benchmark commands). Numbers are the same as the Performance results table: summed across clients, decimal units
 (MB/s, GB/s or TB/s). Charts are native PowerPoint charts, so they can be edited. It uses the tester manual's template
 (`app/assets/report-template.pptx`). The report is saved in the site's `results/` folder as
 `<time>-performance_report.pptx` with a `.md` summary and is listed in 🗒 Logs, where **⤓ Download PowerPoint** saves it.
