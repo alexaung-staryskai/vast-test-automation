@@ -29,6 +29,7 @@ Local web app (runs on your laptop, over the customer VPN) that automates:
 1. **Tenant onboarding + API tests** (VMS REST API): VIP-range check → tenant → admin role → tenant admin → VIP pool → quota → QoS → S3 user + keys → view policy → view. Every step is verified with a GET. Same order and payloads as VAST's tenant onboarding web application (validated on VMS 5.5). On each tenant's card, switches lift and restore its **QoS and quota limits** on the VMS.
 2. **Clients**: SSH consoles in the browser (add as many as needed), required-package check/install/update (including the **VAST NFS driver**), NFSv3 mount (multipath `remoteports` over TCP or RDMA), read-ahead.
 3. **Performance**: elbencho Write / Read / Auto Write/Read presets, configurable in the `elbencho:` config section. Results are parsed and summed across clients, shown in MB/s, GB/s or TB/s, and exported to JSON, TXT and CSV.
+4. **vperfcheck**: VAST's profile-driven elbencho wrapper, run from one client against all of them together (file system and S3), with the passwordless SSH it needs set up and tested by the app. See [vperfcheck](#vperfcheck).
 
 ### Test sites
 
@@ -118,7 +119,8 @@ Preset and package commands run on a PTY. When a command prints something that l
   - `required`: each has a check command, per-distro package names and an optional custom install (elbencho comes from its GitHub static build).
   - `system`: plain OS package names (`curl`, `numactl`, `sysstat`, …), checked in the client's package database (`dpkg-query` / `rpm -q`) and installed with its package manager. Write `{ name: nfs, package: { apt: nfs-common, dnf: nfs-utils } }` when the name differs per distribution. In ⚙ Configuration it is a one-per-line list.
   - `package_managers`: the apt, dnf, yum and zypper `install`, `update`, `reinstall`, `remove` and `upgradable` commands.
-  - Each package can be installed, reinstalled or uninstalled on its own from the Required packages table (per client, or on all ticked clients). A `required` entry with a custom `install` also needs an `uninstall` command for that (elbencho and vastnfs have one); `reinstall` defaults to `install`.
+- `vperfcheck`: download URL, install folder and data folder on the VAST view, default profiles, dataset, time, threads, `elbencho_args` (`--nolive`), whether to stop the services after a run, the run timeout, and the S3 bucket / prefix / endpoint. See [vperfcheck](#vperfcheck).
+  - Each package can be installed, reinstalled or uninstalled on its own from the Required packages window that Presets → Client Cmds → Check packages opens (per client, or on all ticked clients). A `required` entry with a custom `install` also needs an `uninstall` command for that (elbencho and vastnfs have one); `reinstall` defaults to `install`.
 - **VAST NFS driver (`vastnfs`)**: listed in `packages`. **Install missing** builds it from VAST's source package for the client's running kernel (build tools → `download.sh` → `./build.sh bin` → install the .deb/.rpm → `depmod` + initramfs), as in [Quickstart: Multipathing NFS Client](https://docs.vastdata.com/docs/quickstart-multipathing-nfs-client-download-and-install). It does **not** reboot: reboot the client to load the driver, then use **Check VAST driver version** (reads `/sys/module/sunrpc/parameters/nfs_bundle_version`). The client needs internet access to `vastnfs.vastdata.com`.
 - **Mount**: `mount.command` can use `${tenant_vip.start}` / `${tenant_vip.end}` (the VIP pool this site's onboarding created) and `${mount.export_path}` (the created view's path). For example, NFSv3 over RDMA with multipath: `options: proto=rdma,port=20049,vers=3,nconnect=8,remoteports=${tenant_vip.start}-${tenant_vip.end}` and `command: mount -o ${mount.options} ${tenant_vip.start}:${mount.export_path} ${mount.mount_point}`. This needs the VAST NFS driver and an RDMA-capable NIC.
 - `provisioning.on_existing`: `fail` (default) or `reuse` when a same-name object already exists.
@@ -149,15 +151,71 @@ The mock SSH servers only echo commands (and fake elbencho output). Nothing runs
 that configures the site - **without logs or test results**:
 
 - `config.yaml` - VMS connection, onboarding settings, VIP pool, SSH clients, presets, custom Linux commands,
-  report targets and diagram labels
+  report targets and diagram labels, and the `vperfcheck:` defaults
 - `site.yaml` - name, description, status (local paths are removed)
 - `tenants.yaml` - onboarded tenants
+- `results/.vperfcheck-state.json` - the vperfcheck settings saved in **Presets → Vast → Configure vperfcheck**
+  (coordinator, clients, target, dataset, profiles, options). Only those: not what vperfcheck found on this lab's
+  clients (installed version, last dataset, SSH trust), and never an S3 key. The imported site opens with them.
 - optional (tick the box): saved passwords - `.client-secrets.json`, `.tenant-secrets.json` - and the onboarding state
 
 **⤒ Import site** (Test site tab) creates a **new** test site from such a zip; it never overwrites a site (a name that is
 taken gets `-2`, `-3` …). It also accepts a full **Download with results** zip and skips the logs in it. The zip is
 checked first: one site per zip, no paths outside the site folder, a valid config.yaml. Imported password files are
 readable by the owner only (mode 600).
+
+## vperfcheck
+
+[vperfcheck](https://docs.vastdata.com/docs/vperfcheck-automated-performance-testing) is VAST's profile-driven
+elbencho wrapper. One client, the **coordinator**, runs `vperfcheck.sh`; it starts `elbencho --service` on every
+benchmark client over passwordless SSH and runs them together (elbencho's distributed mode), so each profile gives one
+aggregate result. It is in tab ② under **Presets → Vast** (shown once a console is connected):
+
+- **⚙ Configure vperfcheck** opens a window with all the settings (coordinator, benchmark clients, target, dataset,
+  profiles, run and advanced options), the command line, and **✓ Pre-check**, **Dry run**, **▶ Run** and **■ Stop**.
+  **💾 Save** keeps the settings in this browser and on the site (`results/.vperfcheck-state.json`, so another
+  browser starts from them) and logs them in 🗒 Logs (`<time>-vperfcheck-config`, with the command line). Closing
+  with unsaved changes asks first; Run and Dry run save what is on screen first. A typed S3 key pair is never saved.
+- The other Vast items (**⤓ Install / update**, **🔑 Set up SSH trust**, **🔌 Test SSH between clients**, **Remove SSH
+  trust**, **📦 Download Package results**) use the saved coordinator and benchmark clients and show their steps in a
+  small window. **■ Stop vperfcheck** appears there while a run is going.
+
+1. **⤓ Install / update**: downloads the latest stable vperfcheck onto the shared VAST view
+   (`vperfcheck.install_dir`, default `<mount point>/vperfcheck`) from the coordinator. Earlier results are kept.
+   It needs `jq` on the coordinator (in `packages.system`), elbencho on every client (Required packages) and, for S3,
+   the AWS CLI on the coordinator (`aws-cli` in Required packages).
+2. **🔑 Set up SSH trust**: lets the coordinator log in to the ticked clients without a password. It only adds:
+   a dedicated key `~/.ssh/vast_test_bench_vperfcheck` on the coordinator (existing keys are not touched), that key
+   once in each client's `~/.ssh/authorized_keys`, and a marked block at the top of the coordinator's `~/.ssh/config`
+   for those hosts (that key, `StrictHostKeyChecking accept-new`; `User` / `Port` only where they differ). A backup of
+   the config is kept, nothing is removed and the SSH server is not changed, so the logins you use today keep working.
+   Running it again adds hosts. **🔌 Test SSH between clients** logs in from the coordinator to each client the way
+   vperfcheck does. **Remove SSH trust** takes out the ticked hosts (the key goes when none is left).
+   vperfcheck reaches the clients by their `host` in the config.
+3. **✓ Pre-check**: vperfcheck and its version, jq / AWS CLI, the mount and elbencho on every client, SSH from the
+   coordinator, the data directory, and for S3 the keys, the endpoint and the bucket.
+4. **▶ Run vperfcheck** (or **Dry run**): file system (`--dir` = `vperfcheck.dir`) or S3 (`s3://<bucket>/<prefix>/`),
+   dataset **Auto size** (`--prep auto`) / **Use the existing dataset** / **Fixed size**, the profiles, time, threads,
+   `--noloop`, `--lat`, and advanced options (block, file size, I/O depth, direct, random, auto size / time, elbencho
+   pass-through). The command line is shown before it runs. The coordinator's console shows progress; **■ Stop** stops
+   vperfcheck and the elbencho services. After a failed run the app stops the services too.
+5. **Results** come back from the coordinator (vperfcheck's `results.json`, `results.csv`, `results.txt`): one row per
+   profile in **Performance results** and 🗒 Logs (json, txt and csv), the Chart, and the PowerPoint / Word reports.
+   **📦 Download Package results** runs vperfcheck's packaging helper and downloads the `.tar.gz`.
+
+**S3**: the keys are the S3 user onboarding created (or a key pair typed in Configure vperfcheck, used for that run only and never
+saved); the endpoint is the tenant VIP pool in vperfcheck's bracket form (`http://10.0.0.[1-8]`) unless
+`vperfcheck.s3.endpoint` is set; the bucket is the view's bucket (vperfcheck creates it if it's missing). The keys go to
+the coordinator in a file readable only by the SSH user, read by the run and deleted at once; the secret is masked in
+the console and never written to the logs.
+
+**Good to know** (vperfcheck 2026-10-02):
+- vperfcheck keeps one dataset description per install, so **Use the existing dataset** only works for the target it
+  laid out last; the app refuses it for another target and tells you to use Auto size or Fixed size.
+- On an **empty S3 prefix**, vperfcheck wrongly accepts the dataset for Fixed size / Use existing and then fails
+  reading; the app checks the prefix and asks for **Auto size** for the first run on it.
+- Use the **same login user on every benchmark client** (or root): each client's elbencho service runs as its own
+  user, so write profiles can't overwrite files another user laid out. The pre-check warns when they differ.
 
 ## Performance report (PowerPoint and Word)
 

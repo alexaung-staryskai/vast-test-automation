@@ -2,7 +2,7 @@
 
 This file records the changes and design decisions made to VAST Test Bench, with the reasons for them. It is grouped by area, and the latest decision in each area wins. Paths are relative to the repo root.
 
-Last updated: 2026-11-24.
+Last updated: 2026-11-27.
 
 ---
 
@@ -313,3 +313,31 @@ Last updated: 2026-11-24.
 - The calculations (prepare, expected_checks, cluster_compare) are shared by both reports, so the numbers match.
 - Site configuration export / import (no logs) includes the template.
 - dev/mock_vms.py has a small split-cluster inventory (3 CNodes, 1 Ceres v2 DBox, 200G NICs) and `/monitors/ad_hoc_query/`; dev/mock_ssh.py prints latency lines for elbencho `--lat`, so every report page can be tried without a cluster.
+
+## vperfcheck (2026-11-27)
+
+- **Run VAST's own script, don't re-implement it.** The app installs vperfcheck on the shared VAST view and runs
+  `vperfcheck.sh` on one client (the coordinator) through the normal run mechanism, so its output streams to that console
+  and the run lands in Logs like any preset. Its profiles, dataset sizing and summary stay VAST's.
+- **SSH trust is additive and marked.** A dedicated key (`~/.ssh/vast_test_bench_vperfcheck`), a tagged line in
+  `authorized_keys`, and a marked block at the top of the coordinator's `~/.ssh/config` for the chosen hosts only
+  (that key + `StrictHostKeyChecking accept-new`; `User` / `Port` only where they differ). No `IdentitiesOnly` (it
+  would stop the user's own keys working for those hosts), no `BatchMode` in the config, no change to sshd. The block
+  is merged on each setup (hosts are added, not replaced). Remove takes out the tagged key and the block entries only.
+  The coordinator SSHes as its own user, so the trust is per user, never root's.
+- **The keys never go on a command line.** The app writes the S3 credentials to a 600 file on the coordinator over
+  stdin; the run sources it and deletes it before vperfcheck starts. The secret is added to the console's mask list for
+  the run. The command shown and saved holds no secrets.
+- **vperfcheck runs as the SSH user, not with sudo**: its results / artifacts folders and the data folder are made
+  the user's with one sudo step (`mkdir` + `chown`). Per-command `sudo: false` was added to the runner for this.
+- **Results**: after the run the app reads `results.json` (elbencho JSON records) from the coordinator and turns each
+  record into a summary row in the elbencho presets' shape (plus profile, latency, time window), so Performance
+  results, Chart and both reports work unchanged. Auto-sizing's repeated "prepare" records are reduced to the last one.
+  `results.csv` is saved next to the run (Logs lists .csv now).
+- **Working around vperfcheck 2026-10-02**: its S3 dataset check (awk `NR==FNR`) passes on an empty listing, so the
+  app checks the prefix before Fixed size / Use existing; it keeps one treefile per install, so the app remembers the
+  last target and refuses "use existing" for another one; it stops the services only after a successful run, so the
+  app runs `--stop` after a failed one; its packaging helper deletes `.version`, so the app restores it.
+- **Tested** on three Ubuntu 24.04 containers (SSH, sudo with a password, a shared volume as the VAST mount) and an S3
+  server: install, pre-check, SSH trust (incl. existing keys / config, a second user, partial removal), file and S3
+  runs (auto, fixed, existing; bandwidth, IOPS, latency), dry run, stop, package, both reports, and the card in a browser.

@@ -52,6 +52,44 @@ def run_to_text(run: dict) -> str:
                 f"{_fmt(f.get('Throughput MiB/s')):>14} {_fmt(l.get('Throughput MiB/s')):>13} "
                 f"{_fmt(f.get('IOPS')):>13} {_fmt(l.get('IOPS')):>12} {_fmt(r['max_elapsed_s']):>11}s"
             )
+    checked = [c for c in run["clients"] if c.get("packages")]
+    if checked:   # Check packages: the same table as the results window, one block per client
+        L.append("")
+        L.append("=" * 100)
+        L.append("PACKAGES")
+        L.append("=" * 100)
+        for c in checked:
+            st = c["packages"]
+            pk = st.get("packages") or {}
+            miss = sum(1 for p in pk.values() if not p.get("installed"))
+            upd = sum(1 for p in pk.values() if p.get("update_available"))
+            L.append(f"{c['client']} ({c['host']})  package manager={st.get('pm') or '?'}  "
+                     f"{miss} missing, {upd} with updates")
+            for name, p in pk.items():
+                if p.get("installed"):
+                    state = "ok" + ("  (update available)" if p.get("update_available") else "")
+                    info = p.get("version") or ""
+                else:
+                    state, info = "MISSING", p.get("detail") or ""
+                L.append(f"    {name:<16} {state:<26} {info}".rstrip())
+            L.append("")
+    vp = run.get("vperfcheck")
+    if vp:
+        L.append("")
+        L.append("=" * 100)
+        L.append(f"VPERFCHECK {vp.get('version') or ''}  coordinator={vp.get('coordinator')}  hosts={', '.join(vp.get('hosts') or [])}")
+        L.append(f"target: {vp.get('target')}   results on the coordinator: {vp.get('resdir')}")
+        L.append("=" * 100)
+        for r in run.get("summary") or []:
+            last = r.get("totals_last_done") or {}
+            lat = (r.get("lat") or {}).get("avg")
+            L.append(f"{r.get('profile') or '-':<16} {r['operation']:<8} threads={_fmt(r.get('threads')):>4}  "
+                     f"MiB/s={_fmt(last.get('Throughput MiB/s')):>12}  IOPS={_fmt(last.get('IOPS')):>12}  "
+                     f"avg lat={_fmt(lat) + ' us' if lat else '-':>12}  elapsed={_fmt(r.get('max_elapsed_s'))}s")
+        if vp.get("results_txt"):
+            L.append("")
+            L.append("vperfcheck results.txt (tail):")
+            L.extend("    " + ln for ln in vp["results_txt"].splitlines()[-60:])
     for c in run["clients"]:
         L.append("")
         L.append("=" * 100)
@@ -161,7 +199,7 @@ def list_logs(perf_groups: set[str]) -> list[dict]:
         return []
     groups: dict[str, list[Path]] = {}
     for p in RESULTS_DIR.iterdir():
-        if p.is_file() and p.suffix in (".json", ".txt", ".md", ".pptx", ".docx") and not p.name.startswith("."):
+        if p.is_file() and p.suffix in (".json", ".txt", ".md", ".csv", ".pptx", ".docx") and not p.name.startswith("."):
             groups.setdefault(p.stem, []).append(p)
     logs = [_log_entry(stem, files, perf_groups) for stem, files in groups.items()]
     logs.sort(key=lambda e: (e.get("time") or "", e["mtime"]), reverse=True)

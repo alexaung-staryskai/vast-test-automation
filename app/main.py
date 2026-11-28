@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 from pathlib import Path
 
 import httpx
@@ -14,10 +15,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import config, config_store, packages, results, sites
+from . import vperfcheck as vpc
 from .tenants import SecretVault, TenantStore, build_record
 from .config import ROOT, NoSiteError, TemplateError, _expand_env, coerce_var, config_path, load_config, render
 from .ssh import Session, SessionManager
-from .vms import Provisioner, VMSClient
+from .vms import Provisioner, VMSClient, now_iso
 
 
 class State:
@@ -556,7 +558,7 @@ def get_config() -> dict:
                      "password_saved": cl["name"] in _client_secrets()}
                     for cl in c["clients"]],
         "groups": [{"id": g["id"], "label": g.get("label", g["id"]), "results": bool(g.get("results")),
-                    "section": g.get("section", "presets"),   # "packages" puts the button in Required packages
+                    "section": g.get("section", "presets"),   # "packages" puts it in Client Cmds, under Packages
                     "menu": g.get("menu"),                     # Presets dropdown it sits in (none -> Customs)
                     "confirm": g.get("confirm"),               # ask before running (e.g. deletes)
                     "commands": g.get("commands", []),
@@ -1859,6 +1861,530 @@ async def packages_action(body: PkgActionIn) -> dict:
     return _start(group, list(per_session))
 
 
+# ---------------------------------------------------------------- vperfcheck
+# One client (the coordinator) runs VAST's vperfcheck.sh against the ticked clients (elbencho distributed mode).
+
+def _vpc_state() -> dict:
+    try:
+        return json.loads((results.RESULTS_DIR / ".vperfcheck-state.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _vpc_state_update(**kw) -> None:
+    st = {**_vpc_state(), **kw}
+    (results.RESULTS_DIR / ".vperfcheck-state.json").write_text(json.dumps(st, indent=1))
+
+
+def _vpc_settings(s: Session) -> tuple[dict, dict, list[str]]:
+    """(vperfcheck settings rendered for this coordinator, template context, problems)."""
+    ctx = _ctx_for(s, 0)
+    problems: list[str] = []
+    # each mount setting on its own: before onboarding mount.options can't resolve (tenant VIPs), the mount point can
+    raw_mount = state.cfg.get("mount", {}) if isinstance(state.cfg.get("mount"), dict) else {}
+    mount = dict(raw_mount)
+    for _ in range(3):
+        for k, v in raw_mount.items():
+            try:
+                mount[k] = render(v, {**ctx, "mount": mount})
+            except TemplateError:
+                pass
+    ctx = {**ctx, "mount": mount}
+    if "${" in str(mount.get("mount_point", "")):
+        problems.append(f"mount.mount_point is not resolved: {mount.get('mount_point')}")
+    st = vpc.merged(state.cfg.get("vperfcheck"))
+    out: dict = {}
+    for k, v in st.items():
+        try:
+            out[k] = render(v, {**ctx, "vperfcheck": st})
+        except TemplateError as e:
+            out[k] = v
+            problems.append(f"vperfcheck.{k}: {e}")
+    return out, ctx, problems
+
+
+def _vpc_s3(st: dict, ctx: dict, b: "VpcIn") -> dict:
+    keys = state.provisioner.outputs.get("s3_keys")
+    keys = keys if isinstance(keys, dict) else {}
+    view = ctx.get("view") if isinstance(ctx.get("view"), dict) else {}
+    cfg_bucket = str(st["s3"].get("bucket") or "")
+    bucket = (b.s3_bucket or "").strip() or view.get("bucket") or ("" if "${" in cfg_bucket else cfg_bucket)
+    prefix = (b.s3_prefix if b.s3_prefix is not None else str(st["s3"].get("prefix") or "")).strip().strip("/")
+    endpoint = (b.s3_endpoint or "").strip() or str(st["s3"].get("endpoint") or "auto")
+    if endpoint == "auto":
+        ips = state.provisioner.vip_ips()
+        endpoint = vpc.bracket_endpoint(ips) if ips else ""
+    typed = bool((b.s3_access_key or "").strip() and (b.s3_secret_key or "").strip())
+    access = (b.s3_access_key or "").strip() if typed else keys.get("access_key") or ""
+    secret = (b.s3_secret_key or "").strip() if typed else keys.get("secret_key") or ""
+    user = (state.provisioner.outputs.get("s3_user") or {}).get("name") if isinstance(state.provisioner.outputs.get("s3_user"), dict) else None
+    return {"bucket": bucket, "prefix": prefix, "endpoint": endpoint, "access_key": access, "secret_key": secret,
+            "keys_from": "typed" if typed else ("onboarding" if access and secret else ""), "user": user,
+            "target": f"s3://{bucket}/{prefix + '/' if prefix else ''}" if bucket else ""}
+
+
+def _vpc_first_endpoint(endpoint: str) -> str:
+    import re as _re
+    first = endpoint.split(",")[0].strip()
+    return _re.sub(r"\[(\d+)[^\]]*\]", r"\1", first)
+
+
+async def _vpc_s3_listing(coord: Session, s3: dict) -> tuple[bool | None, str]:
+    """(prefix has objects?, raw output) - None when the listing failed."""
+    coord.extra_secrets.add(s3["secret_key"])
+    try:
+        rc, out = await vpc._sh(coord, vpc.write_s3_env_cmd(),
+                                input=vpc.s3_env_file(s3["access_key"], s3["secret_key"], s3["endpoint"]))
+        if rc != 0:
+            return None, out
+        rc, out = await vpc._sh(coord, vpc.s3_list_cmd(_vpc_first_endpoint(s3["endpoint"]), s3["target"]), timeout=60)
+    finally:
+        coord.extra_secrets.discard(s3["secret_key"])
+    if "NoSuchBucket" in out:
+        return False, out
+    if any(w in out for w in ("Could not connect", "An error occurred", "Unable", "denied", "Forbidden", "command not found")):
+        return None, out
+    return bool(out.strip()), out
+
+
+KEEP_OTHER = ("'Use the existing dataset' checks the dataset vperfcheck laid out last ({last}); vperfcheck keeps one dataset "
+              "description per install. For {target} choose Auto size or Fixed size.")
+EMPTY_PREFIX = ("{target} is empty. vperfcheck {ver} treats an empty S3 prefix as a valid dataset when the dataset is "
+                "'Fixed size' or 'Use existing', skips the write and then fails reading. Choose Auto size for the first "
+                "run on this prefix.")
+
+
+class VpcIn(BaseModel):
+    coordinator: str                     # session id of the client that runs vperfcheck.sh
+    hosts: list[str] = []                # session ids of the benchmark clients
+    mode: str = "file"                   # file | s3
+    dir: str | None = None
+    tests: list[str] = []
+    prep_mode: str = "auto"              # auto | keep | size
+    prep_size: str = ""
+    time: str | None = None
+    threads: str | None = None
+    noloop: bool | None = None
+    lat: bool | None = None
+    advanced: dict[str, str] = {}
+    passthrough: str = ""
+    dryrun: bool = False
+    s3_bucket: str | None = None
+    s3_prefix: str | None = None
+    s3_endpoint: str | None = None
+    s3_access_key: str | None = None
+    s3_secret_key: str | None = None
+
+
+def _vpc_sessions(b: VpcIn, need_hosts: bool = True) -> tuple[Session, list[Session]]:
+    coord = _session(b.coordinator)
+    if coord.status != "connected":
+        raise HTTPException(400, f"The coordinator console {coord.client['name']} is not connected")
+    hosts, seen = [], set()
+    for sid in b.hosts:
+        h = _session(sid)
+        if h.client["host"] in seen:
+            continue
+        seen.add(h.client["host"])
+        hosts.append(h)
+    if need_hosts and not hosts:
+        raise HTTPException(400, "Tick at least one benchmark client")
+    return coord, hosts
+
+
+def _vpc_plan(b: VpcIn) -> dict:
+    """Everything a run needs: settings, target, args, command line (no secrets in it)."""
+    if b.mode not in ("file", "s3"):
+        raise HTTPException(400, "mode must be file or s3")
+    coord, hosts = _vpc_sessions(b)
+    st, ctx, problems = _vpc_settings(coord)
+    s3 = _vpc_s3(st, ctx, b) if b.mode == "s3" else None
+    target = s3["target"] if s3 else (b.dir or "").strip() or str(st["dir"])
+    if not target or "${" in target:
+        raise HTTPException(400, "No target: " + ("set the S3 bucket" if s3 else "set the data directory") +
+                            (f" ({'; '.join(problems)})" if problems else ""))
+    if not s3 and not target.startswith("/"):
+        raise HTTPException(400, "The data directory must be an absolute path on the mounted VAST view")
+    install = str(st["install_dir"])
+    if "${" in install:
+        raise HTTPException(400, f"vperfcheck.install_dir is not resolved: {'; '.join(problems)}")
+    stamp = __import__("time").strftime("%Y%m%d-%H%M%S")
+    resdir = f"{install.rstrip('/')}/results/vtb-{stamp}"
+    pick = lambda v, d: d if v is None else v   # noqa: E731
+    opts = {"target": target, "prep": {"mode": b.prep_mode, "size": b.prep_size},
+            "tests": b.tests or (st["s3"]["tests"] if s3 else st["file_tests"]),
+            "time": pick(b.time, st["time"]), "threads": pick(b.threads, st["threads"]),
+            "noloop": pick(b.noloop, st["noloop"]), "lat": pick(b.lat, st["lat"]), "verbose": st["verbose"],
+            "dryrun": b.dryrun, "advanced": b.advanced, "passthrough": b.passthrough,
+            "elbencho_args": st.get("elbencho_args") or ""}
+    host_names = [h.client["host"] for h in hosts]
+    try:
+        args = vpc.run_args(opts, host_names, resdir, bool(st["stop_services_after"]))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    cmd = vpc.run_command(install, args, bool(s3))
+    return {"coord": coord, "hosts": hosts, "host_names": host_names, "st": st, "ctx": ctx, "s3": s3,
+            "target": target, "install": install, "resdir": resdir, "args": args, "cmd": cmd, "opts": opts,
+            "mount_point": str((ctx.get("mount") or {}).get("mount_point") or "")}
+
+
+@app.get("/api/vperfcheck/info")
+def vperfcheck_info(coordinator: str | None = None) -> dict:
+    """Defaults for the Configure vperfcheck window (rendered for the coordinator when one is given)."""
+    raw = vpc.merged(state.cfg.get("vperfcheck"))
+    out = {"settings": raw, "profiles": {"file": vpc.FILE_PROFILES, "s3": vpc.S3_PROFILES}, "state": _vpc_state(),
+           "problems": []}
+    if coordinator and coordinator in state.sessions.sessions:
+        s = state.sessions.sessions[coordinator]
+        st, ctx, problems = _vpc_settings(s)
+        s3 = _vpc_s3(st, ctx, VpcIn(coordinator=coordinator))
+        out.update(settings=st, problems=problems,
+                   s3={k: v for k, v in s3.items() if k not in ("access_key", "secret_key")} | {
+                       "access_key_hint": (s3["access_key"][:4] + "…") if s3["access_key"] else ""})
+    prof = out["state"].get("profiles")
+    if prof:
+        out["profiles"] = {"file": [p for p in prof if p.startswith("file-")] or vpc.FILE_PROFILES,
+                           "s3": [p for p in prof if p.startswith("s3-")] or vpc.S3_PROFILES}
+    return out
+
+
+@app.post("/api/vperfcheck/preview")
+def vperfcheck_preview(b: VpcIn) -> dict:
+    plan = _vpc_plan(b)
+    s3 = plan["s3"]
+    return {"command": plan["cmd"], "target": plan["target"], "hosts": plan["host_names"],
+            "coordinator": plan["coord"].client["name"],
+            "s3": ({k: v for k, v in s3.items() if k not in ("access_key", "secret_key")} | {"keys": bool(s3["access_key"] and s3["secret_key"])}) if s3 else None,
+            "last_target": _vpc_state().get("last_target")}
+
+
+class VpcConfigIn(BaseModel):
+    form: dict[str, str | None] = {}     # the page's saved vperfcheck fields (vpc:* keys; never the S3 secret)
+    run: VpcIn | None = None             # the same settings as a run request, for the command line in the log
+    log: bool = True                     # False: save only (e.g. Run saves what is on screen first)
+
+
+_VPC_SECRET = re.compile(r"secret|password|token|(^|[:_])(ak|sk)$|access_key", re.I)
+
+
+@app.post("/api/vperfcheck/config")
+def vperfcheck_config(b: VpcConfigIn) -> dict:
+    """💾 Save in Configure vperfcheck: keep the settings on the site and log them in 🗒 Logs."""
+    form = {k: ("" if v is None else str(v)) for k, v in b.form.items()
+            if k.startswith("vpc:") and not _VPC_SECRET.search(k)}
+    saved_at = now_iso()
+    _vpc_state_update(saved_config={"saved_at": saved_at, "form": form})
+    out: dict = {"saved_at": saved_at, "files": []}
+    if not b.log:
+        return out
+    command, error, coord, hosts, target = None, None, "", [], None
+    if b.run is not None:
+        run = b.run.model_copy(update={"s3_access_key": None, "s3_secret_key": None, "dryrun": False})
+        try:
+            plan = _vpc_plan(run)
+            command, coord, hosts, target = plan["cmd"], plan["coord"].client["name"], plan["host_names"], plan["target"]
+        except HTTPException as e:
+            error = str(e.detail)
+        settings = run.model_dump(exclude={"s3_access_key", "s3_secret_key", "dryrun"})
+        try:      # session ids -> client names, which mean something in a log
+            settings["coordinator"] = _session(run.coordinator).client["name"]
+            settings["hosts"] = [_session(h).client["name"] for h in run.hosts]
+        except HTTPException:
+            pass
+    else:
+        settings, error = {}, "no connected coordinator: the command line could not be built"
+    stamp = __import__("time").strftime("%Y%m%d-%H%M%S")
+    base = results.RESULTS_DIR / f"{stamp}-vperfcheck-config"
+    results.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    rec = {"run_id": base.name, "group": "vperfcheck-config", "label": "vperfcheck settings saved", "status": "done",
+           "saved_at": saved_at, "clients": [{"client": n} for n in ([coord] if coord else [])],
+           "settings": settings, "target": target, "benchmark_hosts": hosts, "command": command, "command_error": error,
+           "form": form}
+    base.with_suffix(".json").write_text(json.dumps(rec, indent=2))
+    L = [f"vperfcheck settings saved {saved_at}", "=" * 100]
+    for k, v in settings.items():
+        if v not in (None, "", [], {}):
+            L.append(f"{k:<14} {', '.join(map(str, v)) if isinstance(v, list) else json.dumps(v) if isinstance(v, dict) else v}")
+    L += ["", "Command on the coordinator:", f"    {command}" if command else f"    (not built: {error})"]
+    base.with_suffix(".txt").write_text("\n".join(L) + "\n")
+    out["files"] = [base.with_suffix(".json").name, base.with_suffix(".txt").name]
+    out["command"] = command
+    return out
+
+
+@app.post("/api/vperfcheck/install")
+async def vperfcheck_install(b: VpcIn) -> dict:
+    coord, _ = _vpc_sessions(b, need_hosts=False)
+    st, ctx, problems = _vpc_settings(coord)
+    install = str(st["install_dir"])
+    if "${" in install:
+        raise HTTPException(400, f"vperfcheck.install_dir is not resolved: {'; '.join(problems)}")
+    mp = str((ctx.get("mount") or {}).get("mount_point") or "")
+
+    async def post(run: dict) -> None:
+        rc, out = await vpc._sh(coord, f"cat {vpc.q(install)}/.version 2>/dev/null; echo; ls {vpc.q(install)}/profiles 2>/dev/null")
+        lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+        if rc == 0 and lines:
+            _vpc_state_update(version=lines[0], profiles=lines[1:], install_dir=install)
+
+    group = {"id": "vperfcheck-install", "label": "Install vperfcheck", "delay_between_commands_seconds": 0,
+             "per_session": {coord.id: vpc.install_commands(str(st["url"]), install, coord.client["username"], mp)},
+             "post": post}
+    return _start(group, [coord.id])
+
+
+@app.post("/api/vperfcheck/run")
+async def vperfcheck_run(b: VpcIn) -> dict:
+    plan = _vpc_plan(b)
+    coord, s3, st = plan["coord"], plan["s3"], plan["st"]
+    if coord.busy:
+        raise HTTPException(409, f"{coord.client['name']} is running something - wait for it to finish")
+    last = _vpc_state().get("last_target")
+    if b.prep_mode == "keep" and last != plan["target"]:
+        raise HTTPException(400, KEEP_OTHER.format(last=last or "none yet", target=plan["target"]))
+    secret = ""
+    if s3:
+        if not (s3["access_key"] and s3["secret_key"]):
+            raise HTTPException(400, "No S3 keys: run onboarding (it creates the S3 user and keys) or type a key pair")
+        if not s3["endpoint"]:
+            raise HTTPException(400, "No S3 endpoint: run onboarding (the tenant VIP pool) or set the endpoint")
+        rc, out = await vpc._sh(coord, vpc.write_s3_env_cmd(),
+                                input=vpc.s3_env_file(s3["access_key"], s3["secret_key"], s3["endpoint"]))
+        if rc != 0:
+            raise HTTPException(500, f"Could not write the S3 credentials file on {coord.client['name']}: {out}")
+        if b.prep_mode in ("size", "keep") and not b.dryrun:
+            has, out = await _vpc_s3_listing(coord, s3)
+            if has is False:
+                raise HTTPException(400, EMPTY_PREFIX.format(target=s3["target"], ver=_vpc_state().get("version") or ""))
+            rc, out = await vpc._sh(coord, vpc.write_s3_env_cmd(),
+                                    input=vpc.s3_env_file(s3["access_key"], s3["secret_key"], s3["endpoint"]))
+        secret = s3["secret_key"]
+        coord.extra_secrets.add(secret)
+    cmds = []
+    if not s3 and not b.dryrun:
+        shared = any(h.client.get("username") != coord.client.get("username") for h in plan["hosts"])
+        cmds.append(vpc.prepare_dir_command(plan["target"], coord.client["username"], plan["mount_point"], shared))
+    cmds.append({"run": plan["cmd"], "display": plan["cmd"], "sudo": False})
+    resdir, hosts, install = plan["resdir"], plan["host_names"], plan["install"]
+
+    async def post(run: dict) -> None:
+        try:
+            if b.dryrun:
+                return
+            rc, out = await vpc._sh(coord, f"cat {vpc.q(resdir)}/results.json", timeout=120)
+            records = vpc.parse_records(out) if rc == 0 else []
+            files = {}
+            for name in ("results.csv", "results.txt"):
+                rc2, body = await vpc._sh(coord, f"cat {vpc.q(resdir)}/{name}", timeout=120)
+                if rc2 == 0:
+                    files[name] = body
+            if files.get("results.csv"):
+                (results.RESULTS_DIR / f"{run['run_id']}.csv").write_text(files["results.csv"] + "\n")
+            run["vperfcheck"] = {"mode": b.mode, "target": plan["target"], "hosts": hosts,
+                                 "coordinator": coord.client["name"], "install_dir": install, "resdir": resdir,
+                                 "command": plan["cmd"], "version": _vpc_state().get("version"),
+                                 "records": records, "results_txt": files.get("results.txt", "")[-20000:]}
+            run["summary"] = vpc.summary(records, hosts, plan["cmd"])
+            if records:
+                _vpc_state_update(last_target=plan["target"], last_hosts=len(hosts))
+            # vperfcheck stops its elbencho services only after a successful run; after an error the app does it,
+            # so the next run doesn't reuse a leftover service (perhaps another user's or an older elbencho)
+            failed = any(cl.get("status") != "ok" for cl in run.get("clients") or [])
+            if failed and st.get("stop_services_after") and hosts:
+                rc3, out3 = await vpc._sh(coord, f"cd {vpc.q(install)} && ./vperfcheck.sh --stop "
+                                                 + " ".join(vpc.q(h) for h in hosts), timeout=120)
+                run["vperfcheck"]["services_stopped_after_error"] = rc3 == 0
+                await coord.emit(f"\r\n\x1b[2m(the run failed: the elbencho services on the clients were stopped)\x1b[0m\r\n")
+        finally:
+            coord.extra_secrets.discard(secret)
+
+    tests = plan["opts"]["tests"]
+    group = {"id": "vperfcheck", "label": f"vperfcheck {'S3' if s3 else 'file'}: {', '.join(tests)}"
+                                          + (" (dry run)" if b.dryrun else ""),
+             "per_session": {coord.id: cmds}, "delay_between_commands_seconds": 0,
+             "command_timeout_seconds": int(st.get("timeout_seconds") or 14400), "post": post}
+    try:
+        return _start(group, [coord.id])
+    except HTTPException:
+        coord.extra_secrets.discard(secret)
+        raise
+
+
+@app.post("/api/vperfcheck/stop")
+async def vperfcheck_stop(b: VpcIn) -> dict:
+    """Stop a running vperfcheck on the coordinator and the elbencho services on the clients."""
+    coord, hosts = _vpc_sessions(b, need_hosts=False)
+    st, _, _ = _vpc_settings(coord)
+    install = vpc.q(st["install_dir"])
+    names = " ".join(vpc.q(h.client["host"]) for h in hosts)
+    # 1. the running vperfcheck and its elbencho master (bracket patterns: pkill must not match this shell itself)
+    rc1, out1 = await vpc._sh(coord, "pkill -u \"$(id -u)\" -f '[v]perfcheck[.]sh' && echo 'vperfcheck stopped' || echo 'no vperfcheck running'; "
+                                     "pkill -u \"$(id -u)\" -f '[e]lbencho .*--hostsfile' && echo 'elbencho master stopped' || true; "
+                                     f"rm -f {vpc.S3_ENV}", timeout=60)
+    # 2. the elbencho services vperfcheck started on the clients (a separate call: this one names vperfcheck.sh)
+    rc, out2 = (await vpc._sh(coord, f"cd {install} && ./vperfcheck.sh --stop {names}", timeout=120)) if names else (0, "")
+    out = "\n".join(x for x in (out1, out2) if x)
+    await coord.emit(f"\r\n\x1b[33m■ vperfcheck stopped from the app\x1b[0m\r\n{out}\r\n".replace("\n", "\r\n"))
+    return {"ok": rc == 0, "output": out}
+
+
+class VpcTrustIn(BaseModel):
+    coordinator: str
+    hosts: list[str] = []
+    action: str = "test"                 # setup | test | remove
+
+
+@app.post("/api/vperfcheck/trust")
+async def vperfcheck_trust(b: VpcTrustIn):
+    """SSH trust from the coordinator to the clients, streamed step by step (NDJSON)."""
+    from fastapi.responses import StreamingResponse
+    if b.action not in ("setup", "test", "remove"):
+        raise HTTPException(400, "action must be setup, test or remove")
+    coord, targets = _vpc_sessions(VpcIn(coordinator=b.coordinator, hosts=b.hosts))
+    if b.action != "test":
+        off = [t.client["name"] for t in targets if t.status != "connected"]
+        if off:
+            raise HTTPException(400, f"Connect these consoles first: {', '.join(off)}")
+    gen = {"setup": vpc.trust_setup, "test": vpc.trust_test, "remove": vpc.trust_remove}[b.action]
+
+    async def stream():
+        ok = True
+        yield (json.dumps({"t": "start", "action": b.action, "coordinator": coord.client["name"],
+                           "hosts": [t.client["name"] for t in targets]}) + "\n").encode()
+        async for ev in gen(coord, targets):
+            ok = ok and ev.get("status") != "failed"
+            yield (json.dumps({"t": "step", **ev}) + "\n").encode()
+        if b.action == "setup":
+            _vpc_state_update(trust={"coordinator": coord.client["name"], "hosts": [t.client["host"] for t in targets],
+                                     "ok": ok, "at": results_now()})
+        yield (json.dumps({"t": "done", "ok": ok}) + "\n").encode()
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+@app.post("/api/vperfcheck/precheck")
+async def vperfcheck_precheck(b: VpcIn):
+    """Everything vperfcheck needs, checked before a run (NDJSON)."""
+    from fastapi.responses import StreamingResponse
+    plan = _vpc_plan(b)
+    coord, hosts, st, s3 = plan["coord"], plan["hosts"], plan["st"], plan["s3"]
+    install, mp = plan["install"], plan["mount_point"]
+    q = vpc.q
+
+    async def stream():
+        ok = True
+
+        def ev(step, label, status, detail=""):
+            nonlocal ok
+            ok = ok and status != "failed"
+            return (json.dumps({"t": "step", "step": step, "label": label, "status": status, "detail": detail}) + "\n").encode()
+
+        yield (json.dumps({"t": "start", "action": "precheck", "coordinator": coord.client["name"]}) + "\n").encode()
+        # 1. vperfcheck installed on the coordinator
+        rc, out = await vpc._sh(coord, f"cat {q(install)}/.version && ls {q(install)}/profiles")
+        lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+        if rc == 0 and lines:
+            _vpc_state_update(version=lines[0], profiles=lines[1:], install_dir=install)
+            missing = [t for t in plan["opts"]["tests"] if "*" not in t and t not in lines[1:]]
+            yield ev("install", f"vperfcheck in {install}", "failed" if missing else "ok",
+                     f"version {lines[0]}" + (f" · unknown profile(s): {', '.join(missing)}" if missing else ""))
+        else:
+            yield ev("install", f"vperfcheck in {install}", "failed", "not installed - click Install vperfcheck")
+        # 2. tools on the coordinator
+        rc, out = await vpc._sh(coord, "command -v jq && jq --version")
+        yield ev("jq", f"jq on {coord.client['name']} (vperfcheck needs it for the summary)", "ok" if rc == 0 else "failed",
+                 out.splitlines()[-1] if rc == 0 else "missing - install jq (Required packages)")
+        if s3:
+            rc, out = await vpc._sh(coord, "command -v aws >/dev/null && aws --version")
+            yield ev("aws", f"AWS CLI on {coord.client['name']} (S3 mode)", "ok" if rc == 0 else "failed",
+                     out.splitlines()[-1] if rc == 0 and out else "missing - install aws-cli (Required packages)")
+        # 3. elbencho: vperfcheck runs the coordinator's elbencho path on every client
+        rc, out = await vpc._sh(coord, f"for p in {q(install)}/artifacts/elbencho /usr/local/bin/elbencho /usr/bin/elbencho; "
+                                       "do [ -x \"$p\" ] && { echo \"$p\"; exit 0; }; done; exit 1")
+        epath = out.splitlines()[-1] if rc == 0 and out else ""
+        yield ev("elbencho", f"elbencho on {coord.client['name']}", "ok" if epath else "warn",
+                 epath or "not found - vperfcheck downloads it into the shared install folder (needs internet)")
+        # 4. each client: mount, elbencho at the same path, SSH from the coordinator
+        for h in hosts:
+            label = f"{h.client['name']} ({h.client['host']})"
+            if h.status != "connected":
+                yield ev(f"host:{h.id}", label, "warn", "console not connected - only the SSH test from the coordinator runs")
+            else:
+                checks = []
+                if mp:
+                    checks.append(f"mountpoint -q {q(mp)} && echo 'mount ok' || echo 'MISSING mount {mp}'")
+                if epath:
+                    checks.append(f"[ -x {q(epath)} ] && echo 'elbencho ok' || echo 'MISSING {epath}'")
+                rc, out = await vpc._sh(h, "; ".join(checks) or "true")
+                bad = [ln for ln in out.splitlines() if ln.startswith("MISSING")]
+                yield ev(f"host:{h.id}", label, "failed" if bad or rc != 0 else "ok",
+                         "; ".join(bad) if bad else ", ".join(out.splitlines()) or "ok")
+        users = sorted({h.client.get("username") or "" for h in hosts} | {coord.client.get("username") or ""})
+        if len(users) > 1:
+            yield ev("users", "Login users", "warn",
+                     f"the clients log in as different users ({', '.join(users)}). Each client's elbencho runs as its own user, "
+                     "so write profiles fail on files another user laid out. Use the same user (or root) on every client.")
+        async for e in vpc.trust_test(coord, hosts):
+            if e["status"] == "failed":
+                e["detail"] = (e.get("detail") or "") + " - click Set up SSH trust"
+            ok = ok and e["status"] != "failed"
+            yield (json.dumps({"t": "step", "label": e.get("label", ""), **e}) + "\n").encode()
+        # 5. target
+        if not s3:
+            rc, out = await vpc._sh(coord, f"if [ -d {q(plan['target'])} ]; then [ -w {q(plan['target'])} ] && echo writable || echo 'exists, not writable (the run makes it yours with sudo)'; else echo 'does not exist yet (the run creates it with sudo)'; fi")
+            yield ev("target", f"Data directory {plan['target']}", "ok", out)
+        else:
+            if not (s3["access_key"] and s3["secret_key"]):
+                yield ev("s3keys", "S3 keys", "failed", "none - run onboarding (creates the S3 user and keys) or type a key pair")
+            elif not s3["endpoint"]:
+                yield ev("s3ep", "S3 endpoint", "failed", "none - run onboarding (tenant VIP pool) or set it")
+            else:
+                yield ev("s3keys", "S3 keys", "ok", f"from {s3['keys_from']}" + (f" (user {s3['user']})" if s3.get("user") else ""))
+                first = _vpc_first_endpoint(s3["endpoint"])
+                has, out = await _vpc_s3_listing(coord, s3)
+                label = f"S3 {first} → {s3['target']}"
+                if has is None:
+                    yield ev("s3", label, "failed", out[-300:] or "no answer")
+                elif not has:
+                    empty_bad = b.prep_mode in ("size", "keep")
+                    yield ev("s3", label, "failed" if empty_bad else "ok",
+                             EMPTY_PREFIX.format(target=s3["target"], ver=_vpc_state().get("version") or "") if empty_bad
+                             else f"reachable; nothing under the prefix yet (Auto size lays the dataset out) · endpoints {s3['endpoint']}")
+                else:
+                    yield ev("s3", label, "ok", f"reachable; objects found under the prefix · endpoints {s3['endpoint']}")
+        # 6. dataset
+        last = _vpc_state().get("last_target")
+        if b.prep_mode == "keep" and last != plan["target"]:
+            yield ev("dataset", "Dataset", "failed", KEEP_OTHER.format(last=last or "none yet", target=plan["target"]))
+        yield (json.dumps({"t": "done", "ok": ok}) + "\n").encode()
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+@app.post("/api/vperfcheck/package")
+async def vperfcheck_package(b: VpcIn) -> FileResponse:
+    """Run vperfcheck's packaging helper (results + tool configuration) and download the .tar.gz."""
+    import time as _t
+    coord, _ = _vpc_sessions(b, need_hosts=False)
+    st, _, _ = _vpc_settings(coord)
+    install = vpc.q(st["install_dir"])
+    # the helper is written for vperfcheck's git checkout: it rewrites .version and then deletes it - keep ours
+    rc, out = await vpc._sh(coord, f"cd {install} && cp -p .version .version.vtb 2>/dev/null; "
+                                   "helpers/vperfcheck_package.sh >/dev/null 2>&1; "
+                                   "[ -f .version.vtb ] && mv -f .version.vtb .version; "
+                                   "ls -t builds/*.tar.gz 2>/dev/null | head -1", timeout=600)
+    rel = out.splitlines()[-1].strip() if out else ""
+    if not rel.endswith(".tar.gz"):
+        raise HTTPException(500, f"The packaging helper made no archive: {out[-300:]}")
+    local = results.RESULTS_DIR / f"{_t.strftime('%Y%m%d-%H%M%S')}-vperfcheck-package.tar.gz"
+    try:
+        async with coord.conn.start_sftp_client() as sftp:
+            await sftp.get(f"{st['install_dir']}/{rel}", str(local))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"Could not copy {rel} from {coord.client['name']}: {e}")
+    return FileResponse(local, filename=local.name, media_type="application/gzip")
+
+
 # ---------------------------------------------------------------- results
 
 class ConsoleExportIn(BaseModel):
@@ -1892,7 +2418,7 @@ def export_console(body: ConsoleExportIn) -> dict:
 
 
 def _perf_groups() -> set[str]:
-    return {g["id"] for g in state.cfg.get("command_groups", []) if g.get("results")}
+    return {g["id"] for g in state.cfg.get("command_groups", []) if g.get("results")} | {"vperfcheck"}
 
 
 class LogsActionIn(BaseModel):

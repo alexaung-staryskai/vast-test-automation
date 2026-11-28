@@ -350,6 +350,32 @@ packages:
       reinstall: zypper --non-interactive install -f ${pkg.names}
       remove: zypper --non-interactive remove ${pkg.names}
       upgradable: zypper -q list-updates
+# ---------------------------------------------------------------------
+# vperfcheck (Tab 2 -> Presets -> Vast): VAST's profile-driven elbencho wrapper. One client (the coordinator) runs it and
+# drives all the benchmark clients together over passwordless SSH (🔑 Set up SSH trust does that for you).
+# https://docs.vastdata.com/docs/vperfcheck-automated-performance-testing
+# ---------------------------------------------------------------------
+vperfcheck:
+  url: http://vast-vperfsanity.s3.amazonaws.com/download/vperfcheck-latest-stable.tar.gz
+  install_dir: "${mount.mount_point}/vperfcheck"      # on the shared VAST view, so every client sees the same files
+  dir: "${mount.mount_point}/vperfcheck-data"           # --dir for the file-system profiles
+  file_tests: [file-read-bw, file-read-iops]           # profiles ticked by default (vperfcheck's own default)
+  prep: auto                                            # auto | keep (validate the existing dataset) | a size such as 1t
+  time: 1m                                              # --time per profile
+  threads: ""                                           # --threads per client ("" = the profile's own, usually 64)
+  noloop: false                                         # --noloop: run each profile once instead of looping for --time
+  lat: false                                            # --lat: latency measurements
+  verbose: true                                         # --verbose: print the elbencho command lines it runs
+  elbencho_args: "--nolive"                             # passed to elbencho after "--" (--nolive: no full-screen live view, clean logs)
+  stop_services_after: true                             # --stop: stop the elbencho services on the clients when done
+  timeout_seconds: 14400                                # the whole run (prepare + all profiles)
+  s3:
+    bucket: "${vars.bucket_name}"                       # the bucket onboarding created (vperfcheck creates it if missing)
+    prefix: vperfcheck
+    endpoint: auto                                      # auto = the tenant VIP pool, e.g. http://172.16.1.[10-17]
+    tests: [s3-read-bw, s3-read-iops]
+    # S3 keys: the S3 user onboarding created (or a key pair typed in Configure vperfcheck, used once, never saved)
+
 execution:
   delay_between_commands_seconds: 1
   command_timeout_seconds: 3600

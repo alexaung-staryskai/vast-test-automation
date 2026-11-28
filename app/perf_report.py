@@ -27,7 +27,7 @@ UNITS = {"MB": 1e6, "GB": 1e9, "TB": 1e12}            # decimal throughput units
 MIB = 1048576
 
 PERF_OPS = ("READ", "WRITE")                # the report shows only the read / write phases
-PERF_TOOLS = ("elbencho", "fio", "vdbench", "iozone", "ior", "mdtest", "warp", "dd")   # benchmark commands worth showing
+PERF_TOOLS = ("elbencho", "vperfcheck.sh", "fio", "vdbench", "iozone", "ior", "mdtest", "warp", "dd")   # benchmark commands worth showing
 
 TEMPLATE = Path(__file__).parent / "assets" / "report-template.pptx"
 
@@ -51,6 +51,15 @@ def _num(v: Any) -> float | None:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _window(w) -> tuple | None:
+    """vperfcheck summary rows carry their own [start, end] (ISO); elbencho presets get it from the commands."""
+    if isinstance(w, (list, tuple)) and len(w) == 2:
+        a, b = _when(w[0]), _when(w[1])
+        if a and b:
+            return (a, b)
+    return None
 
 
 def _when(iso: str | None) -> datetime | None:
@@ -130,8 +139,9 @@ def rows_for(run: dict) -> list[dict]:
             "per_client": per_client.get((r.get("command_index"), str(r.get("operation"))), {}),
             "lat_clients": per_client_lat.get((r.get("command_index"), str(r.get("operation"))), {}),
             "lat": _combine_latency(per_client_lat.get((r.get("command_index"), str(r.get("operation"))), {}),
-                                    per_client_iops.get((r.get("command_index"), str(r.get("operation"))), {})),
-            "window": tuple(windows[r.get("command_index")]) if r.get("command_index") in windows else None,
+                                    per_client_iops.get((r.get("command_index"), str(r.get("operation"))), {})) or r.get("lat"),
+            "window": tuple(windows[r.get("command_index")]) if r.get("command_index") in windows else _window(r.get("window")),
+            "profile": r.get("profile") or "",   # vperfcheck: the profile (file-read-bw, s3-read-iops, ...)
         })
     return out
 
@@ -166,7 +176,7 @@ def _fmt(v: float | None, d: int = 2) -> str:
 
 def _cat(r: dict) -> str:
     t = r["started"].strftime("%m-%d %H:%M") if r["started"] else ""
-    return f"{r['operation'].title()} · {t}"
+    return f"{r.get('profile') or r['operation'].title()} · {t}"
 
 
 # ------------------------------------------------------------------ template helpers (as in the manual's builder)
@@ -1056,7 +1066,7 @@ def build(runs: list[dict], out: Path, *, site: str, unit: str = "GB", vms: str 
           "|---|---|---|---:|---:|---:|---:|---:|"]
     for r in rows:
         t = r["started"].strftime("%Y-%m-%d %H:%M") if r["started"] else ""
-        md.append(f"| {r['label']} · {t} | {r['operation']} | {', '.join(r['clients'])} | {_fmt(_tp(r['tp_last'], unit))} | "
+        md.append(f"| {r['label']} · {t} | {r['operation']}{' · ' + r['profile'] if r.get('profile') else ''} | {', '.join(r['clients'])} | {_fmt(_tp(r['tp_last'], unit))} | "
                   f"{_fmt(_tp(r['tp_first'], unit))} | {_fmt(r['iops_last'], 0)} | {_fmt(r['elapsed'], 1)} | {_ms((r['lat'] or {}).get('p99'))} |")
     out.with_suffix(".md").write_text("\n".join(md) + "\n")
     return {"file": out.name, "slides": n_slides, "runs": nr, "rows": len(rows),

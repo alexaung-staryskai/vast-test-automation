@@ -225,6 +225,22 @@ SECRET_FILES = (".client-secrets.json", ".tenant-secrets.json")
 STATE_FILE = ".provision_state.json"          # onboarding state (created object ids, generated password)
 MAX_IMPORT_BYTES = 40 * 1024 * 1024
 REPORT_TEMPLATE = "report-template.docx"        # Word report template uploaded in ⚙ Configuration
+VPC_STATE = ".vperfcheck-state.json"           # vperfcheck: settings saved in Configure vperfcheck (+ run state)
+VPC_DROP = ("vpc:coordId", "vpc:savedAt")       # a console session id means nothing on another app / after a restart
+
+
+def vpc_saved_settings(raw: bytes | str) -> bytes | None:
+    """Only the 💾 saved vperfcheck settings from a .vperfcheck-state.json - not the run state that describes this
+    lab's clients (installed version, last dataset, SSH trust). None when nothing was saved."""
+    try:
+        sc = (json.loads(raw) or {}).get("saved_config")
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(sc, dict) or not isinstance(sc.get("form"), dict):
+        return None
+    form = {str(k): ("" if v is None else str(v)) for k, v in sc["form"].items()
+            if str(k).startswith("vpc:") and k not in VPC_DROP and not re.search(r"secret|password|token", str(k), re.I)}
+    return json.dumps({"saved_config": {"saved_at": str(sc.get("saved_at") or ""), "form": form}}, indent=1).encode()
 
 
 def _site_files(path: Path) -> tuple[str, str]:
@@ -238,8 +254,9 @@ def _site_files(path: Path) -> tuple[str, str]:
 
 def export_config_zip(path: Path, include_secrets: bool = False, app_version: str = "") -> tuple[bytes, list[str]]:
     """Everything that configures the site - no logs / results, no config backups:
-    config.yaml (VMS connection, onboarding settings, VIP pool, clients, presets, custom commands, report targets),
-    site.yaml (name, description, status), the tenants file and the Word report template. include_secrets adds the saved passwords
+    config.yaml (VMS connection, onboarding settings, VIP pool, clients, presets, custom commands, report targets,
+    vperfcheck defaults), site.yaml (name, description, status), the tenants file, the Word report template and the
+    vperfcheck settings saved in Configure vperfcheck. include_secrets adds the saved passwords
     (.client-secrets.json, .tenant-secrets.json) and the onboarding state."""
     tfile, rdir = _site_files(path)
     files = [("config.yaml", path / "config.yaml"), ("site.yaml", path / "site.yaml")]
@@ -250,13 +267,21 @@ def export_config_zip(path: Path, include_secrets: bool = False, app_version: st
         files += [(n, path / n) for n in SECRET_FILES]
         files.append((f"results/{STATE_FILE}", path / rdir / STATE_FILE))
     files = [(n, f) for n, f in files if f.is_file()]
+    vpc = None                                                  # vperfcheck settings (no secrets in them)
+    try:
+        vpc = vpc_saved_settings((path / rdir / VPC_STATE).read_bytes())
+    except OSError:
+        pass
+    names = [n for n, _ in files] + ([f"results/{VPC_STATE}"] if vpc else [])
     meta = info(path)
     manifest = {"format": 1, "kind": "vast-test-bench-site", "app_version": app_version, "exported_at": _now(),
                 "site": {"name": meta["name"], "description": meta["description"], "vms": meta["vms"]},
-                "files": [n for n, _ in files], "includes_secrets": include_secrets, "tenants_file": tfile}
+                "files": names, "includes_secrets": include_secrets, "tenants_file": tfile}
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr(f"{path.name}/{MANIFEST}", json.dumps(manifest, indent=2))
+        if vpc:
+            z.writestr(f"{path.name}/results/{VPC_STATE}", vpc)
         for n, f in files:
             if n == "site.yaml":   # no local absolute paths (user name, folders) in a zip that gets shared
                 try:
@@ -270,7 +295,7 @@ def export_config_zip(path: Path, include_secrets: bool = False, app_version: st
                 except (OSError, yaml.YAMLError):
                     pass
             z.write(f, f"{path.name}/{n}")
-    return buf.getvalue(), [n for n, _ in files]
+    return buf.getvalue(), names
 
 
 def import_zip(data: bytes, filename: str = "") -> dict:
@@ -330,6 +355,7 @@ def import_zip(data: bytes, filename: str = "") -> dict:
         wanted[n] = n
     wanted[REPORT_TEMPLATE] = REPORT_TEMPLATE
     wanted[f"results/{STATE_FILE}"] = f"{rdir}/{STATE_FILE}" if "/" not in rdir and ".." not in rdir else None
+    wanted[f"results/{VPC_STATE}"] = f"{rdir}/{VPC_STATE}" if "/" not in rdir and ".." not in rdir else None
     skipped = sorted(n for n in rel if n not in wanted and n != MANIFEST)
     # a unique display name and folder
     base = str(meta.get("name") or manifest.get("site", {}).get("name") or root or Path(filename).stem or "Imported site").strip()
@@ -350,7 +376,12 @@ def import_zip(data: bytes, filename: str = "") -> dict:
                 continue
             target = path / dst
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(read(src))
+            data_ = read(src)
+            if src == f"results/{VPC_STATE}":          # only the saved settings, whatever else the file holds
+                data_ = vpc_saved_settings(data_)
+                if data_ is None:
+                    continue
+            target.write_bytes(data_)
             if posixpath.basename(dst).startswith("."):
                 target.chmod(0o600)                       # passwords / keys / onboarding state: owner only
             written.append(src)

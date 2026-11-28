@@ -225,19 +225,7 @@
       <div id="clientList" class="clientlist"></div>
     </section>
 
-    <div id="presetsHint" class="card muted small presets-hint">Required packages and presets (mount, elbencho…) appear here once a console is connected.</div>
-    <section class="card collapsible" id="pkgCard" hidden>
-      <div class="card-head">
-        <h2><button type="button" class="collapse-toggle" aria-expanded="true" aria-controls="pkgCard" title="Hide / show this section"><span class="chev" aria-hidden="true">▾</span> Required packages</button></h2>
-        <div class="btn-row">
-          <button class="btn" id="pkgCheck">Check packages</button>
-          <button class="btn primary" id="pkgInstall">Install missing</button>
-          <button class="btn" id="pkgUpdate">Update</button>
-          <span id="pkgGroups" class="btn-row"></span>
-        </div>
-      </div>
-      <div id="pkgTable" class="muted small">Runs on the consoles that are ticked ✓. Install/update commands come from the <code>packages</code> section of the config.</div>
-    </section>
+    <div id="presetsHint" class="card muted small presets-hint">Presets (packages, mount, elbencho…) appear here once a console is connected.</div>
 
     <section class="card collapsible" id="presetsCard" hidden>
       <div class="card-head">
@@ -414,6 +402,48 @@
       <div id="ccList" class="cc-list"></div>
     </section>
   </main>
+
+  <!-- Check packages results: opens when a check finishes, or from Client Cmds → Show last check -->
+    <div class="modal-backdrop ds-backdrop" id="pkgModal" hidden>
+      <div class="modal ds-modal pkg-modal" role="dialog" aria-modal="true" aria-labelledby="pkgTitle">
+        <div class="ds-head"><h3 id="pkgTitle">Required packages</h3>
+          <button class="btn ghost sm ds-x" id="pkgModalX" title="Close (Esc)" aria-label="Close">✕</button></div>
+        <div id="pkgTable" class="ds-body pkg-body"></div>
+      </div>
+    </div>
+
+  <!-- vperfcheck: Presets → Vast → Configure vperfcheck. The form and its actions live here; the
+       other vperfcheck actions are in the Vast menu and show their steps in #vpcStepsModal. -->
+  <div class="modal-backdrop ds-backdrop" id="vpcModal" hidden>
+    <div class="modal ds-modal vpc-modal" role="dialog" aria-modal="true" aria-labelledby="vpcTitle">
+      <div class="ds-head"><h3 id="vpcTitle">⚙ Configure vperfcheck <span class="pill" id="vpcVersion" hidden></span></h3>
+        <button class="btn ghost sm ds-x" id="vpcModalX" title="Close (Esc)" aria-label="Close">✕</button></div>
+      <div class="ds-body">
+        <div class="muted small vpc-intro">VAST's profile-driven elbencho wrapper. The <b>coordinator</b> runs it and drives all the benchmark clients together
+          (elbencho distributed mode), so each profile gives one aggregate result. <a href="https://docs.vastdata.com/docs/vperfcheck-automated-performance-testing" target="_blank" rel="noopener">Docs ↗</a></div>
+        <div id="vpcForm" class="vpc-form"></div>
+        <div class="vpc-cmdwrap"><div class="small muted">Command on the coordinator</div><pre id="vpcCmd" class="vpc-cmd">…</pre></div>
+        <div id="vpcSteps" class="vpc-steps" aria-live="polite"></div>
+      </div>
+      <div class="btn-row modal-actions vpc-actions">
+        <button class="btn" id="vpcPrecheck" title="Check vperfcheck, jq / AWS CLI, mounts, elbencho, SSH and the target before running">✓ Pre-check</button>
+        <button class="btn" id="vpcDry" title="vperfcheck --dryrun: show what it would run (saves the settings first)">Dry run</button>
+        <button class="btn" id="vpcRun" title="Saves the settings, then runs vperfcheck">▶ Run vperfcheck</button>
+        <button class="btn danger" id="vpcStop" hidden title="Stop vperfcheck and the elbencho services on the clients">■ Stop</button>
+        <span class="vpc-gap"></span>
+        <span id="vpcSaved" class="small muted" aria-live="polite"></span>
+        <button class="btn ghost" id="vpcClose">Close</button>
+        <button class="btn primary" id="vpcSaveBtn" title="Save these settings (this browser and the site) and log them in 🗒 Logs">💾 Save</button>
+      </div>
+    </div>
+  </div>
+  <div class="modal-backdrop ds-backdrop" id="vpcStepsModal" hidden>
+    <div class="modal ds-modal vpc-steps-modal" role="dialog" aria-modal="true" aria-labelledby="vpcStepsTitle">
+      <div class="ds-head"><h3 id="vpcStepsTitle">vperfcheck</h3>
+        <button class="btn ghost sm ds-x" id="vpcStepsX" title="Close (Esc)" aria-label="Close">✕</button></div>
+      <div id="vpcStepsBox" class="ds-body vpc-steps" aria-live="polite"></div>
+    </div>
+  </div>
 
   <script src="/static/vendor/xterm.min.js"></script>
   <script src="/static/vendor/addon-fit.min.js"></script>

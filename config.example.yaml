@@ -333,6 +333,32 @@ elbencho:
   drop_caches_command: 'echo "before:"; free -h | head -2; sync && echo 3 > /proc/sys/vm/drop_caches && echo "page cache, dentries and inodes dropped"; echo "after:"; free -h | head -2'
 
 # ---------------------------------------------------------------------
+# vperfcheck (Tab 2 -> Presets -> Vast): VAST's profile-driven elbencho wrapper. One client (the coordinator) runs it and
+# drives all the benchmark clients together over passwordless SSH (🔑 Set up SSH trust does that for you).
+# https://docs.vastdata.com/docs/vperfcheck-automated-performance-testing
+# ---------------------------------------------------------------------
+vperfcheck:
+  url: http://vast-vperfsanity.s3.amazonaws.com/download/vperfcheck-latest-stable.tar.gz
+  install_dir: "${mount.mount_point}/vperfcheck"      # on the shared VAST view, so every client sees the same files
+  dir: "${mount.mount_point}/vperfcheck-data"           # --dir for the file-system profiles
+  file_tests: [file-read-bw, file-read-iops]           # profiles ticked by default (vperfcheck's own default)
+  prep: auto                                            # auto | keep (validate the existing dataset) | a size such as 1t
+  time: 1m                                              # --time per profile
+  threads: ""                                           # --threads per client ("" = the profile's own, usually 64)
+  noloop: false                                         # --noloop: run each profile once instead of looping for --time
+  lat: false                                            # --lat: latency measurements
+  verbose: true                                         # --verbose: print the elbencho command lines it runs
+  elbencho_args: "--nolive"                             # passed to elbencho after "--" (--nolive: no full-screen live view, clean logs)
+  stop_services_after: true                             # --stop: stop the elbencho services on the clients when done
+  timeout_seconds: 14400                                # the whole run (prepare + all profiles)
+  s3:
+    bucket: "${vars.bucket_name}"                       # the bucket onboarding created (vperfcheck creates it if missing)
+    prefix: vperfcheck
+    endpoint: auto                                      # auto = the tenant VIP pool, e.g. http://172.16.1.[10-17]
+    tests: [s3-read-bw, s3-read-iops]
+    # S3 keys: the S3 user onboarding created (or a key pair typed in Configure vperfcheck, used once, never saved)
+
+# ---------------------------------------------------------------------
 # Required client packages (Tab 2 -> "Check packages")
 #   check     command that succeeds when the package is installed; first output line = version
 #   package   package name per package manager when it differs from "name"
@@ -343,6 +369,7 @@ elbencho:
 # ---------------------------------------------------------------------
 packages:
   system:
+    - jq               # vperfcheck needs it on the coordinator
     - curl
     - numactl          # numactl --hardware: NUMA layout for pinning benchmark threads
     - sysstat          # iostat / sar / mpstat while a test runs
@@ -435,6 +462,20 @@ packages:
         fi
         command -v depmod >/dev/null && depmod -a
         echo "== REBOOT the client to unload the VAST NFS driver; until then Check packages still shows it as loaded"
+    - name: aws-cli
+      # AWS CLI v2 (vperfcheck S3 mode runs it on the coordinator), from the official installer for this CPU
+      check: command -v aws >/dev/null && aws --version
+      install_label: install AWS CLI v2 from awscli.amazonaws.com (official installer)
+      install: |
+        set -e
+        command -v unzip >/dev/null || { if command -v apt-get >/dev/null; then apt-get install -y unzip; elif command -v dnf >/dev/null; then dnf install -y unzip; else yum install -y unzip; fi; }
+        W=$(mktemp -d); cd "$W"
+        curl -fsSL -o awscliv2.zip "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip"
+        unzip -q awscliv2.zip
+        ./aws/install --update
+        cd /; rm -rf "$W"
+        aws --version
+      uninstall: 'rm -rf /usr/local/aws-cli /usr/local/bin/aws /usr/local/bin/aws_completer && echo "AWS CLI removed"'
   package_managers:
     apt:
       install: apt-get update && apt-get install -y ${pkg.names}
@@ -524,7 +565,7 @@ command_groups:
 
   - id: vastnfs_version
     label: Check VAST driver version
-    section: packages          # shown next to Check packages / Install missing / Update
+    section: packages          # shown in Presets → Client Cmds, under Packages
     sudo: false
     commands:
       - display: check the VAST NFS driver (installed package, loaded module)

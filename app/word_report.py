@@ -710,7 +710,7 @@ def write_summary(runs: list[dict], out: Path, *, site: str, unit: str = "GB", v
           "|---|---|---|---:|---:|---:|---:|---:|"]
     for r in data["rows"]:
         t = r["started"].strftime("%Y-%m-%d %H:%M") if r["started"] else ""
-        md.append(f"| {r['label']} · {t} | {r['operation']} | {', '.join(r['clients'])} | {pr._fmt(pr._tp(r['tp_last'], unit))} | "
+        md.append(f"| {r['label']} · {t} | {r['operation']}{' · ' + r['profile'] if r.get('profile') else ''} | {', '.join(r['clients'])} | {pr._fmt(pr._tp(r['tp_last'], unit))} | "
                   f"{pr._fmt(pr._tp(r['tp_first'], unit))} | {pr._fmt(r['iops_last'], 0)} | {pr._fmt(r['elapsed'], 1)} | "
                   f"{pr._ms((r['lat'] or {}).get('p99'))} |")
     out.write_text("\n".join(md) + "\n")

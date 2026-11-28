@@ -1251,7 +1251,7 @@ let pkgStatus = {};
 function renderPackages() {
   const ids = Object.keys(pkgStatus).filter((id) => consoles.has(id))
     .sort((a, b) => String(pkgStatus[a].client).localeCompare(String(pkgStatus[b].client), undefined, { numeric: true }));
-  if (!ids.length) return;
+  if (!ids.length) { pkgModal(false); return; }
   const names = CFG.packages;
   // one row per package, one column per client: stays narrow however many packages the config lists
   const info = (n) => (CFG.package_info || {})[n] || {};
@@ -1275,9 +1275,12 @@ function renderPackages() {
   const rows = names.map((n) => `<tr><td><b>${esc(n)}</b>${info(n).system ? ` <span class="muted small">system</span>` : ""}${rowActs(n)}</td>${ids.map((id) => cell(id, n)).join("")}</tr>`).join("");
   const missing = ids.reduce((a, id) => a + Object.values(pkgStatus[id].packages).filter((p) => !p.installed).length, 0);
   const upd = ids.reduce((a, id) => a + Object.values(pkgStatus[id].packages).filter((p) => p.update_available).length, 0);
+  const when = ids.map((id) => pkgStatus[id].checked_at).filter(Boolean).sort().pop();
+  $("#pkgTitle").textContent = `Required packages${when ? ` · checked ${new Date(when).toLocaleString()}` : ""}`;
   $("#pkgTable").innerHTML = `<table class="pkgs"><thead>${head}</thead><tbody>${rows}</tbody></table>
     <div class="small muted" style="margin-top:6px">${missing} missing · ${upd} with updates available.
-    Packages with a custom <code>install</code> command (e.g. elbencho) are re-installed by <b>Update</b>.</div>`;
+    Install/update commands come from the <code>packages</code> section of the config; packages with a custom
+    <code>install</code> command (e.g. elbencho) are re-installed by <b>Update</b>.</div>`;
 }
 // Install / Reinstall / Uninstall one package: a cell acts on that client, the row's buttons on the ticked clients
 $("#pkgTable").addEventListener("click", async (e) => {
@@ -1300,10 +1303,33 @@ $("#pkgTable").addEventListener("click", async (e) => {
     if (!ok) return;
   }
   const verb = { install: "Install", reinstall: "Reinstall", uninstall: "Uninstall" }[action];
+  // close the window so the consoles stay visible (an install can stop and wait for input there);
+  // it opens again with fresh results once the re-check after the action is done
+  pkgModal(false);
+  toast(`${verb} ${pkg} on ${who}: running. The package table opens again when it finishes.`, "ok", 5000);
   busy(b, () => startRun("/api/packages/action", { session_ids: ids, package: pkg, action }, `${verb} ${pkg}`,
-    () => startRun("/api/packages/check", { session_ids: ids }, "Check packages", loadPkgStatus)));
+    () => startRun("/api/packages/check", { session_ids: ids }, "Check packages", () => loadPkgStatus(true))));
 });
-async function loadPkgStatus() { pkgStatus = await api("GET", "/api/packages/status").catch(() => ({})); renderPackages(); }
+// open = true after a check finishes: shows the results window
+async function loadPkgStatus(open) {
+  pkgStatus = await api("GET", "/api/packages/status").catch(() => ({}));
+  renderPackages();
+  if (open === true && Object.keys(pkgStatus).some((id) => consoles.has(id))) pkgModal(true);
+}
+function pkgModal(show) {
+  const m = $("#pkgModal");
+  if (!show) { m.hidden = true; return; }
+  m.hidden = false;
+  $("#pkgModalX").focus();
+}
+$("#pkgModalX").onclick = () => pkgModal(false);
+$("#pkgModal").addEventListener("mousedown", (e) => { if (e.target === e.currentTarget) pkgModal(false); });
+document.addEventListener("keydown", (e) => {
+  // Esc closes it only when no confirm dialog is open on top of it
+  if (e.key !== "Escape" || $("#pkgModal").hidden) return;
+  const open = $$(".modal-backdrop").filter((x) => !x.hidden);
+  if (open[open.length - 1] === $("#pkgModal")) pkgModal(false);
+});
 
 async function startRun(url, body, label, onDone) {
   const ids = body.session_ids;
@@ -1311,11 +1337,20 @@ async function startRun(url, body, label, onDone) {
   const { run_id } = await api("POST", url, body);
   trackRun(run_id, label, onDone);
 }
-$("#pkgCheck").onclick = (e) => busy(e.target, () => startRun("/api/packages/check", { session_ids: selectedIds() }, "Check packages", loadPkgStatus));
-$("#pkgInstall").onclick = (e) => busy(e.target, () => startRun("/api/packages/install", { session_ids: selectedIds(), mode: "missing" }, "Install missing packages", () => $("#pkgCheck").click()));
-$("#pkgUpdate").onclick = async (e) => {
-  if (!(await uiConfirm({ title: "Update packages?", ok: "Update", html: "Updates the required packages on the ticked clients." }))) return;
-  busy(e.target, () => startRun("/api/packages/install", { session_ids: selectedIds(), mode: "update" }, "Update packages", () => $("#pkgCheck").click()));
+// Check packages / Install missing / Update live in the Client Cmds menu (data-pkgact)
+const pkgCheck = () => startRun("/api/packages/check", { session_ids: selectedIds() }, "Check packages", () => loadPkgStatus(true));
+const PKG_ACTS = {
+  check: pkgCheck,
+  show: async () => {
+    await loadPkgStatus();
+    if (!Object.keys(pkgStatus).some((id) => consoles.has(id))) return alert("No package check yet for the connected consoles - run Check packages");
+    pkgModal(true);
+  },
+  missing: () => startRun("/api/packages/install", { session_ids: selectedIds(), mode: "missing" }, "Install missing packages", pkgCheck),
+  update: async () => {
+    if (!(await uiConfirm({ title: "Update packages?", ok: "Update", html: "Updates the required packages on the ticked clients." }))) return;
+    return startRun("/api/packages/install", { session_ids: selectedIds(), mode: "update" }, "Update packages", pkgCheck);
+  },
 };
 
 /* ---- presets ---- */
@@ -1323,11 +1358,11 @@ $("#pkgUpdate").onclick = async (e) => {
 function updatePresetsVisibility() {
   const any = [...consoles.values()].some((c) => c.status === "connected");
   $("#disconnectAll").hidden = ![...consoles.values()].some((c) => c.status === "connected" || c.status === "connecting");
-  $("#pkgCard").hidden = !any;
   $("#presetsCard").hidden = !any;
   $("#presetsHint").hidden = any;
+  if (any) vpcTargets();
 }
-// Required packages / Presets fold down to their title bar; the choice is remembered in this browser
+// Presets / vperfcheck fold down to their title bar; the choice is remembered in this browser
 function setCollapsed(card, collapsed) {
   card.classList.toggle("collapsed", collapsed);
   const b = $(".collapse-toggle", card);
@@ -1351,29 +1386,45 @@ function elbenchoInfo(e) {
 }
 // Presets are grouped into dropdown menus by each group's `menu:` key. Built-in presets fall back to
 // their usual menu by id (older site configs have no `menu:`); anything else goes under Customs.
-const PRESET_MENUS = ["Client Cmds", "Connection", "File System", "Performance Test", "Utilities"];
+const PRESET_MENUS = ["Client Cmds", "Connection", "File System", "Performance Test", "Vast", "Utilities"];
 const DEFAULT_MENU = { precheck: "Client Cmds", client_info: "Client Cmds", ping_vip: "Connection",
   mount: "File System", mount_status: "File System", readahead: "File System", unmount: "File System",
   elbencho_write: "Performance Test", elbencho_read: "Performance Test", elbencho: "Performance Test",
   elbencho_delete: "Utilities", drop_caches: "Utilities" };
+// Client Cmds also carries the package actions: Check / Install missing / Update, then the config's
+// `section: packages` groups (e.g. Check VAST driver version) unless they name another menu.
+const PKG_ITEMS = [["check", "Check packages"], ["show", "Show last check"], ["missing", "Install missing"], ["update", "Update packages…"]];
 function presetMenus(groups) {
   const menus = new Map(PRESET_MENUS.map((m) => [m, []]));
+  const pkgGroups = groups.filter((g) => g.section === "packages" && !g.menu);
+  const item = (g) => {
+    const danger = g.confirm && DEFAULT_MENU[g.id];      // red only for the built-in destructive ones (Delete)
+    return `<button type="button" role="menuitem" class="pmenu-item${danger ? " danger" : ""}" data-group="${esc(g.id)}"${g.confirm ? ' title="Asks before running"' : ""}>${esc(g.label)}${g.confirm && !danger ? "…" : ""}</button>`;
+  };
+  const pkgHtml = `<div class="pmenu-sep" role="separator">Packages</div>` +
+    PKG_ITEMS.map(([a, l]) => `<button type="button" role="menuitem" class="pmenu-item" data-pkgact="${a}">${esc(l)}</button>`).join("") +
+    pkgGroups.map(item).join("");
+  // Vast: the vperfcheck actions (their code is in the vperfcheck part at the end of this file)
+  const vastHtml = `<div class="pmenu-sep" role="separator">vperfcheck</div>` + VPC_ITEMS.map(([a, ic, l, t, cls]) =>
+    `<button type="button" role="menuitem" class="pmenu-item pi-ic${cls ? ` ${cls}` : ""}" data-vpcact="${a}" title="${esc(t)}"${a === "stop" && !VPC.runId ? " hidden" : ""}><span class="pi" aria-hidden="true">${ic}</span>${esc(l)}</button>`).join("");
   for (const g of groups) {
+    if (pkgGroups.includes(g)) continue;
     const m = g.menu || DEFAULT_MENU[g.id] || "Customs";
     if (!menus.has(m)) menus.set(m, []);          // a new menu name in the config gets its own dropdown
     menus.get(m).push(g);
   }
   const customs = menus.get("Customs") || [];      // Customs always comes last, even when empty
   menus.delete("Customs"); menus.set("Customs", customs);
-  return [...menus].filter(([m, gs]) => gs.length || m === "Customs").map(([m, gs], i) => `
+  return [...menus].filter(([m, gs]) => gs.length || m === "Customs" || m === "Client Cmds" || m === "Vast").map(([m, gs], i) => `
     <div class="pmenu">
       <button type="button" class="btn pmenu-btn${gs.some((g) => g.results) ? " primary" : ""}" aria-haspopup="menu" aria-expanded="false"
         aria-controls="pmenu-${i}">${esc(m)} <span class="chev" aria-hidden="true">▾</span></button>
-      <div class="pmenu-list" id="pmenu-${i}" role="menu" hidden>${gs.length
-        ? gs.map((g) => {
-            const danger = g.confirm && DEFAULT_MENU[g.id];      // red only for the built-in destructive ones (Delete)
-            return `<button type="button" role="menuitem" class="pmenu-item${danger ? " danger" : ""}" data-group="${esc(g.id)}"${g.confirm ? ' title="Asks before running"' : ""}>${esc(g.label)}${g.confirm && !danger ? "…" : ""}</button>`;
-          }).join("")
+      <div class="pmenu-list" id="pmenu-${i}" role="menu" hidden>${m === "Client Cmds"
+        ? gs.map(item).join("") + pkgHtml
+        : m === "Vast"
+        ? gs.map(item).join("") + vastHtml
+        : gs.length
+        ? gs.map(item).join("")
         : `<div class="pmenu-empty">No custom commands yet.<br><a href="#" data-goto-cc>Add one in ⚙ Configuration → Custom Linux commands</a></div>`}</div>
     </div>`).join("");
 }
@@ -1418,9 +1469,7 @@ function renderPresets() {
     <b>VIP</b><span>${esc(String(m.vip).toLowerCase() === "auto" ? "auto — clients spread over the tenant VIP pool" : m.vip)}</span>
     <b>Options</b><span class="mono">${esc(m.options)}</span><b>Read-ahead</b><span>${esc(m.read_ahead_kb)} KB</span>` +
     elbenchoInfo(CFG.elbencho || {});
-  const groupBtn = (g) => `<button class="btn ${g.results ? "primary" : ""}" data-group="${esc(g.id)}">${g.section === "packages" ? "" : "▶ "}${esc(g.label)}</button>`;
-  $("#presets").innerHTML = presetMenus(CFG.groups.filter((g) => g.section !== "packages"));
-  $("#pkgGroups").innerHTML = CFG.groups.filter((g) => g.section === "packages").map(groupBtn).join("");
+  $("#presets").innerHTML = presetMenus(CFG.groups);
   $("#cmdList").innerHTML = CFG.groups
     .map((g) => `<div><b>${esc(g.label)}</b> <span class="muted small">· delay ${g.delay}s${g.results ? " · results exported" : ""}</span>
       <ol>${g.commands.map((c) => `<li>${esc(typeof c === "string" ? c : c.wait !== undefined ? `⏸ idle ${c.wait}s${c.label ? ` (${c.label})` : ""}` : c.run)}</li>`).join("")}</ol></div>`)
@@ -1430,7 +1479,6 @@ function renderPresets() {
 }
 $("#toggleCmds").onclick = (e) => { e.preventDefault(); const l = $("#cmdList"); l.hidden = !l.hidden; e.target.textContent = l.hidden ? "show commands" : "hide commands"; };
 
-$("#pkgGroups").addEventListener("click", (e) => $("#presets").dispatchEvent(new CustomEvent("rungroup", { detail: e.target.dataset.group })));
 // presets with `confirm:` in the config ask first (e.g. deleting benchmark files)
 async function confirmGroup(g) {
   if (!g.confirm) return true;
@@ -1438,12 +1486,14 @@ async function confirmGroup(g) {
   return uiConfirm({ title: `${g.label}?`, ok: g.label, danger: true,
     html: `<p>${esc(g.confirm)}</p><p class="muted">Runs on ${n} ticked console${n === 1 ? "" : "s"}.</p>` });
 }
-$("#presets").addEventListener("rungroup", async (e) => {
-  const g = CFG.groups.find((x) => x.id === e.detail);
-  if (!g || !(await confirmGroup(g))) return;
-  try { await startRun("/api/runs", { group: g.id, session_ids: selectedIds() }, g.label); } catch (err) { alert(err.message); }
-});
 $("#presets").addEventListener("click", async (e) => {
+  const va = e.target.closest(".pmenu-item")?.dataset.vpcact;
+  if (va) return vpcMenu(va, $(".pmenu-btn", e.target.closest(".pmenu")));
+  const pa = e.target.closest(".pmenu-item")?.dataset.pkgact;
+  if (pa) {
+    const menuBtn = $(".pmenu-btn", e.target.closest(".pmenu"));
+    return busy(menuBtn, PKG_ACTS[pa]);
+  }
   const gid = e.target.closest(".pmenu-item")?.dataset.group;
   if (!gid) return;
   const g = CFG.groups.find((x) => x.id === gid);
@@ -1500,7 +1550,8 @@ const opsPerSec = (m) => m["Files/s"] || m["Dirs/s"] || null;   // metadata phas
 // One row per operation: the aggregate across clients, and (for the CSV) each client on its own
 function perfRows(run) {
   const agg = (run.summary || []).map((r) => ({
-    scope: "all clients", index: r.command_index, operation: r.operation, clients: r.clients.join(" + "), command: r.command,
+    scope: "all clients", index: r.command_index, operation: r.profile ? `${r.operation} · ${r.profile}` : r.operation,
+    clients: r.clients.join(" + "), command: r.command,
     tp_first: r.totals_first_done["Throughput MiB/s"], tp_last: r.totals_last_done["Throughput MiB/s"],
     iops_first: r.totals_first_done["IOPS"], iops_last: r.totals_last_done["IOPS"],
     ops_last: opsPerSec(r.totals_last_done), total_mib: r.totals_last_done["Total MiB"],
@@ -2045,6 +2096,7 @@ const SECTION_INFO = {
   tenant_admin: "Tenant admin role and password policy", provisioning: "Tenant onboarding steps (REST calls)",
   ssh: "Default SSH login for clients", clients: "SSH client hosts", mount: "Standard NFSv3 mount and read-ahead",
   elbencho: "Benchmark size and commands; idle_before_read_seconds = pause between write and read in Auto Write/Read",
+  vperfcheck: "VAST's elbencho wrapper (tab ② → vperfcheck): where it goes, default profiles, dataset, S3 bucket / endpoint",
   packages: "Required client packages and how to install them", execution: "Delays, timeouts, input prompts",
   command_groups: "Preset buttons in Tab 2",
 };
@@ -2580,7 +2632,11 @@ function resetUi() {
   pkgStatus = {}; vipData = null; provResults = {};
   $("#vipMap").innerHTML = ""; $("#runStatus").innerHTML = ""; $("#summary").innerHTML = "";
   $("#secrets").innerHTML = ""; $("#cleanupOut").innerHTML = ""; $("#vipSettingsMsg").innerHTML = "";
-  $("#pkgTable").innerHTML = "Runs on the consoles that are ticked ✓.";
+  $("#pkgTable").innerHTML = ""; pkgModal(false);
+  // vperfcheck: the next site loads its own settings and state
+  Object.assign(VPC, { info: null, built: false, runId: null, dirty: false });
+  $("#vpcForm").innerHTML = ""; $("#vpcSteps").innerHTML = ""; $("#vpcStepsBox").innerHTML = "";
+  $("#vpcModal").hidden = true; $("#vpcStepsModal").hidden = true; vpcRunUi();
   cfgEdit.loaded = false;
   // the custom commands belong to the site: reload them for the newly opened one
   cc.loaded = false; cc.list = []; cc.mtime = null; ccSetDirty(false); ccMsg(""); renderCustomCmds();
@@ -2614,7 +2670,8 @@ async function exportSiteModal(path, name) {
     html: `<p>Everything that configures this site, <b>without logs or test results</b>:</p>
       <ul class="small rs-list"><li><code>config.yaml</code> - VMS connection, onboarding settings, VIP pool, SSH clients, presets,
         custom Linux commands, report targets and diagram labels</li>
-        <li><code>site.yaml</code> - name, description, status</li><li><code>tenants.yaml</code> - onboarded tenants</li></ul>
+        <li><code>site.yaml</code> - name, description, status</li><li><code>tenants.yaml</code> - onboarded tenants</li>
+        <li>the Word report template and the vperfcheck settings saved in Presets → Vast → Configure vperfcheck</li></ul>
       <label class="ds-warn small"><input type="checkbox" id="expSecrets">
         <span>Also include the saved passwords - SSH client passwords, tenant admin password, S3 keys - and the onboarding state.
         <b>Anyone with the zip can read them.</b></span></label>
@@ -3318,3 +3375,399 @@ $("#appVer").addEventListener("click", () => { if ($("#appVer").classList.contai
 applyTheme();
 showVersion();
 fetch("/api/sites").then((r) => r.json()).then((d) => (d.current ? startApp() : showSites()));
+
+
+/* ================= vperfcheck (tab ②: Presets → Vast) =================
+   One client (the coordinator) runs VAST's vperfcheck.sh and drives the ticked benchmark clients together.
+   The settings form sits in the Configure vperfcheck window (#vpcModal) and is saved with 💾 Save (this browser,
+   the site's .vperfcheck-state.json and a log entry); the Vast menu's other actions use the saved form. */
+const VPC = { info: null, mode: store.get("vpc:mode") || "file", built: false, timer: null, runId: null, busy: false, dirty: false };
+// [action, icon, label, tooltip, extra class]: the Vast menu in Presets
+const VPC_ITEMS = [
+  ["install", "⤓", "Install / update", "Download vperfcheck onto the shared VAST view (from the coordinator)"],
+  ["trust", "🔑", "Set up SSH trust", "Let the coordinator SSH to the benchmark clients without a password (what vperfcheck needs)"],
+  ["trusttest", "🔌", "Test SSH between clients", "From the coordinator, log in to every benchmark client the way vperfcheck does"],
+  ["trustremove", "", "Remove SSH trust", "Remove the key and settings the app added"],
+  ["package", "📦", "Download Package results", "Run vperfcheck's packaging helper and download the .tar.gz"],
+  ["configure", "⚙", "Configure vperfcheck", "Coordinator, clients, target, dataset, profiles and options; Pre-check, Dry run and Run"],
+  ["stop", "■", "Stop vperfcheck", "Stop vperfcheck and the elbencho services on the clients", "danger"],
+];
+const vpcLive = () => [...consoles.values()].filter((c) => c.status === "connected");
+const vpcName = (c) => c.info?.name || c.id;
+const vpcVal = (id) => ($(`#${id}`)?.value ?? "").trim();
+
+function vpcBuild() {
+  const st = VPC.info?.settings || {};
+  const prof = VPC.info?.profiles || { file: [], s3: [] };
+  const defTests = new Set(VPC.mode === "s3" ? st.s3?.tests || [] : st.file_tests || []);
+  const kept = new Set(store.get(`vpc:tests:${VPC.mode}`) ? JSON.parse(store.get(`vpc:tests:${VPC.mode}`)) : [...defTests]);
+  const s3 = VPC.info?.s3 || {};
+  const adv = store.get("vpc:adv") ? JSON.parse(store.get("vpc:adv")) : {};
+  $("#vpcForm").innerHTML = `
+    <div class="vpc-row"><label class="vpc-l">Coordinator</label>
+      <select id="vpcCoord" title="The client that runs vperfcheck.sh; it SSHes to the benchmark clients"></select>
+      <span class="muted small">runs vperfcheck and drives the others</span></div>
+    <div class="vpc-row"><label class="vpc-l">Benchmark clients</label><span id="vpcHosts" class="vpc-hosts"></span></div>
+    <div class="vpc-row"><label class="vpc-l">Target</label>
+      <span class="seg vpc-mode"><button class="btn sm ${VPC.mode === "file" ? "primary" : "ghost"}" data-vmode="file">File system</button><button class="btn sm ${VPC.mode === "s3" ? "primary" : "ghost"}" data-vmode="s3">S3</button></span>
+      ${VPC.mode === "file"
+        ? `<input id="vpcDir" class="mono vpc-wide" placeholder="${esc(st.dir || "")}" value="${esc(store.get("vpc:dir") || "")}" title="--dir: a folder on the mounted VAST view (empty = ${esc(st.dir || "")})">`
+        : `<input id="vpcBucket" class="mono" placeholder="${esc(s3.bucket || "bucket")}" value="${esc(store.get("vpc:bucket") || "")}" title="Bucket (empty = ${esc(s3.bucket || "the view's bucket")}); created if missing">
+           <span class="muted">/</span><input id="vpcPrefix" class="mono" placeholder="prefix" value="${esc(store.get("vpc:prefix") ?? (s3.prefix || ""))}" title="Prefix inside the bucket">`}
+    </div>
+    ${VPC.mode === "s3" ? `<div class="vpc-row"><label class="vpc-l">S3 endpoint</label>
+      <input id="vpcEndpoint" class="mono vpc-wide" placeholder="${esc(s3.endpoint || "http://<VIP>.[1-8]")}" value="${esc(store.get("vpc:endpoint") || "")}" title="AWS_ENDPOINT_URL_S3; empty = the tenant VIP pool (${esc(s3.endpoint || "after onboarding")}). Brackets expand: http://10.0.0.[1-8]">
+      <span id="vpcKeysNote" class="small ${s3.keys_from ? "muted" : "err"}" data-base="${s3.keys_from ? "1" : ""}">${s3.keys_from ? `keys from ${esc(s3.keys_from)}${s3.user ? ` (S3 user ${esc(s3.user)})` : ""} · ${esc(s3.access_key_hint || "")}` : "no S3 keys yet - run onboarding or type a key pair below"}</span></div>
+      <details class="vpc-adv"><summary class="small">Use other S3 keys</summary><div class="vpc-row">
+        <input id="vpcAk" class="mono" placeholder="access key" autocomplete="off" spellcheck="false">
+        <input id="vpcSk" class="mono masked" type="text" placeholder="secret key" autocomplete="off" spellcheck="false" data-lpignore="true">
+        <span class="muted small">used for this run only, never saved</span></div></details>` : ""}
+    <div class="vpc-row"><label class="vpc-l">Dataset</label>
+      <select id="vpcPrep" title="--prep">
+        <option value="auto">Auto size (lay out / re-size: --prep auto)</option>
+        <option value="keep">Use the existing dataset (validate it)</option>
+        <option value="size">Fixed size</option></select>
+      <input id="vpcSize" class="mono vpc-short" placeholder="1t" value="${esc(store.get("vpc:size") || "")}" title="--prep <size>, e.g. 500g or 1t">
+      <span id="vpcPrepHint" class="muted small"></span></div>
+    <div class="vpc-row"><label class="vpc-l">Profiles</label><span class="vpc-profs">${(prof[VPC.mode] || []).map((p) =>
+      `<label class="vpc-chk" title="${esc(p)}"><input type="checkbox" class="vpc-prof" value="${esc(p)}" ${kept.has(p) ? "checked" : ""}> ${esc(p)}</label>`).join("")}</span></div>
+    <div class="vpc-row"><label class="vpc-l">Run</label>
+      <label class="small">time <input id="vpcTime" class="mono vpc-short" placeholder="${esc(st.time || "1m")}" value="${esc(store.get("vpc:time") || "")}" title="--time: per profile (30s, 1m, 2h)"></label>
+      <label class="small">threads/client <input id="vpcThreads" class="mono vpc-short" placeholder="${esc(st.threads || "profile")}" value="${esc(store.get("vpc:threads") || "")}" title="--threads (empty = the profile's own, usually 64)"></label>
+      <label class="vpc-chk small"><input type="checkbox" id="vpcNoloop" ${(store.get("vpc:noloop") ?? (st.noloop ? "1" : "")) ? "checked" : ""}> run once (--noloop)</label>
+      <label class="vpc-chk small"><input type="checkbox" id="vpcLat" ${(store.get("vpc:lat") ?? (st.lat ? "1" : "")) ? "checked" : ""}> latency (--lat)</label></div>
+    <details class="vpc-adv" id="vpcAdvBox"><summary class="small">Advanced options</summary><div class="vpc-row vpc-advrow">
+      ${[["block", "block", "8m / 1m / 4k"], ["filesize", "file size", "1g"], ["iodepth", "I/O depth", "16"], ["autosize", "auto start size", "16g"], ["autotime", "auto min time", "1m"]].map(([k, l, ph]) =>
+        `<label class="small">${l} <input id="vpcAdv_${k}" class="mono vpc-short vpc-advin" data-k="${k}" placeholder="${ph}" title="--${k}" value="${esc(adv[k] || "")}"></label>`).join("")}
+      <label class="small">direct I/O <select id="vpcAdv_direct" class="vpc-advin" data-k="direct" title="--direct"><option value="">profile</option><option value="1">on</option><option value="0">off</option></select></label>
+      <label class="small">random <select id="vpcAdv_rand" class="vpc-advin" data-k="rand" title="--rand"><option value="">profile</option><option value="1">on</option><option value="0">off</option></select></label>
+      <label class="small vpc-wide">elbencho pass-through <input id="vpcPass" class="mono vpc-wide" placeholder="e.g. --cpu --lathisto" title="Everything here goes after -- straight to elbencho" value="${esc(store.get("vpc:pass") || "")}"></label>
+    </div></details>`;
+  $("#vpcPrep").value = store.get(`vpc:prep:${VPC.mode}`) || "auto";
+  for (const k of ["direct", "rand"]) $(`#vpcAdv_${k}`).value = adv[k] || "";
+  VPC.built = true;
+  vpcTargets();
+  vpcPrepUi();
+}
+function vpcPrepUi() {
+  const v = $("#vpcPrep")?.value;
+  if (!v) return;
+  $("#vpcSize").hidden = v !== "size";
+  $("#vpcPrepHint").textContent = v === "auto" ? "grows the dataset until the write phase lasts the auto min time (1m); use it first and after adding clients"
+    : v === "keep" ? "checks the dataset vperfcheck laid out last; nothing is written" : "lays out this total size (skipped if it already exists)";
+}
+// coordinator + benchmark-client lists follow the connected consoles
+function vpcTargets() {
+  if (!VPC.built) { if (vpcLive().length) vpcInit(); return; }
+  const live = vpcLive();
+  const sel = $("#vpcCoord"), keep = sel.value || store.get("vpc:coord");
+  sel.innerHTML = live.map((c) => `<option value="${esc(c.id)}" data-name="${esc(vpcName(c))}">${esc(vpcName(c))} - ${esc(c.info?.username || "")}@${esc(c.info?.host || "")}</option>`).join("");
+  const byName = live.find((c) => vpcName(c) === keep || c.id === keep);
+  if (byName) sel.value = byName.id;
+  // every connected console is a benchmark client unless you unticked it (remembered by client name)
+  const off = new Set(store.get("vpc:off") ? JSON.parse(store.get("vpc:off")) : []);
+  const cur = Object.fromEntries($$(".vpc-host").map((i) => [i.dataset.name, i.checked]));   // unsaved ticks on screen
+  $("#vpcHosts").innerHTML = live.length ? live.map((c) => {
+    const n = vpcName(c), on = n in cur ? cur[n] : !off.has(n);
+    return `<label class="vpc-chk"><input type="checkbox" class="vpc-host" value="${esc(c.id)}" data-name="${esc(n)}" ${on ? "checked" : ""}> ${esc(n)} <span class="muted small">${esc(c.info?.host || "")}</span></label>`;
+  }).join("") : '<span class="muted small">connect consoles first</span>';
+  vpcPreview();
+}
+async function vpcInit() {
+  try { VPC.info = await api("GET", "/api/vperfcheck/info" + (store.get("vpc:coordId") ? `?coordinator=${encodeURIComponent(store.get("vpc:coordId"))}` : "")); }
+  catch { VPC.info = { settings: {}, profiles: { file: [], s3: [] } }; }
+  // The site's saved settings win: this browser keeps one set for all sites, so after switching sites, importing
+  // one or saving in another browser, take what was last saved on the open site. Save writes both, so they agree.
+  const saved = VPC.info.state?.saved_config;
+  if (saved?.form && saved.saved_at !== store.get("vpc:savedAt")) {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) if (localStorage.key(i).startsWith("vpc:")) keys.push(localStorage.key(i));
+    keys.forEach((k) => { try { localStorage.removeItem(k); } catch {} });
+    for (const [k, v] of Object.entries(saved.form)) if (k.startsWith("vpc:")) store.set(k, v);
+    store.set("vpc:savedAt", saved.saved_at || "");
+    VPC.mode = store.get("vpc:mode") || "file";
+  } else if (!saved?.form && store.get("vpc:savedAt")) {
+    store.set("vpc:savedAt", "");          // nothing saved on this site yet: don't show another site's "saved" time
+  }
+  vpcBuild();
+  await vpcRefreshInfo();
+}
+async function vpcRefreshInfo() {
+  const coord = $("#vpcCoord")?.value;
+  if (!coord) return;
+  try { VPC.info = await api("GET", `/api/vperfcheck/info?coordinator=${encodeURIComponent(coord)}`); } catch { return; }
+  const v = VPC.info.state?.version;
+  $("#vpcVersion").hidden = !v; $("#vpcVersion").textContent = v || ""; $("#vpcVersion").title = v ? `vperfcheck version ${v}` : "";
+  const keepScroll = $("#vpcAdvBox")?.open;
+  const vals = vpcSnapshot();
+  vpcBuild(); vpcRestore(vals);
+  if (keepScroll) $("#vpcAdvBox").open = true;
+}
+// what is on screen (saved or not): fields by id, plus the ticked clients and profiles
+function vpcSnapshot() {
+  return { ...Object.fromEntries($$("#vpcForm input[id], #vpcForm select[id]").map((e) => [e.id, e.type === "checkbox" ? e.checked : e.value])),
+    _profs: $$(".vpc-prof:checked").map((i) => i.value), _hosts: Object.fromEntries($$(".vpc-host").map((i) => [i.dataset.name, i.checked])) };
+}
+function vpcRestore(v) {
+  for (const [id, val] of Object.entries(v)) {
+    if (id.startsWith("_")) continue;
+    const e = $(`#${id}`); if (!e || id === "vpcCoord") continue; if (e.type === "checkbox") e.checked = val; else e.value = val;
+  }
+  if (v._profs) for (const i of $$(".vpc-prof")) i.checked = v._profs.includes(i.value);
+  if (v._hosts) for (const i of $$(".vpc-host")) if (i.dataset.name in v._hosts) i.checked = v._hosts[i.dataset.name];
+  vpcPrepUi(); vpcKeysNote();
+}
+function vpcBody(extra = {}) {
+  const adv = Object.fromEntries($$(".vpc-advin").map((e) => [e.dataset.k, e.value.trim()]).filter(([, v]) => v));
+  const b = {
+    coordinator: $("#vpcCoord")?.value, hosts: $$(".vpc-host:checked").map((i) => i.value), mode: VPC.mode,
+    tests: $$(".vpc-prof:checked").map((i) => i.value), prep_mode: $("#vpcPrep")?.value || "auto", prep_size: vpcVal("vpcSize"),
+    time: vpcVal("vpcTime") || null, threads: vpcVal("vpcThreads") || null, noloop: !!$("#vpcNoloop")?.checked, lat: !!$("#vpcLat")?.checked,
+    advanced: adv, passthrough: vpcVal("vpcPass"), ...extra,
+  };
+  if (VPC.mode === "file") b.dir = vpcVal("vpcDir") || null;
+  else Object.assign(b, { s3_bucket: vpcVal("vpcBucket") || null, s3_prefix: $("#vpcPrefix") ? $("#vpcPrefix").value.trim() : null,
+    s3_endpoint: vpcVal("vpcEndpoint") || null, s3_access_key: vpcVal("vpcAk") || null, s3_secret_key: vpcVal("vpcSk") || null });
+  return b;
+}
+// writes the form to this browser (vpc:* keys); vpcSaveConfig() also stores it on the site and logs it
+function vpcSave() {
+  const set = (k, v) => store.set(k, v ?? "");
+  set("vpc:mode", VPC.mode);
+  set("vpc:coord", $("#vpcCoord")?.selectedOptions[0]?.dataset.name); set("vpc:coordId", $("#vpcCoord")?.value);
+  const off = new Set(store.get("vpc:off") ? JSON.parse(store.get("vpc:off")) : []);
+  for (const i of $$(".vpc-host")) i.checked ? off.delete(i.dataset.name) : off.add(i.dataset.name);
+  set("vpc:off", JSON.stringify([...off]));
+  set(`vpc:tests:${VPC.mode}`, JSON.stringify($$(".vpc-prof:checked").map((i) => i.value)));
+  set(`vpc:prep:${VPC.mode}`, $("#vpcPrep")?.value);
+  for (const [k, id] of [["dir", "vpcDir"], ["bucket", "vpcBucket"], ["endpoint", "vpcEndpoint"], ["size", "vpcSize"], ["time", "vpcTime"], ["threads", "vpcThreads"]])
+    if ($(`#${id}`)) set(`vpc:${k}`, $(`#${id}`).value.trim());
+  if ($("#vpcPrefix")) set("vpc:prefix", $("#vpcPrefix").value.trim());
+  set("vpc:noloop", $("#vpcNoloop")?.checked ? "1" : ""); set("vpc:lat", $("#vpcLat")?.checked ? "1" : "");
+  set("vpc:adv", JSON.stringify(Object.fromEntries($$(".vpc-advin").map((e) => [e.dataset.k, e.value.trim()]).filter(([, v]) => v))));
+  if ($("#vpcPass")) set("vpc:pass", $("#vpcPass").value.trim());
+}
+function vpcPreview() {
+  clearTimeout(VPC.timer);
+  VPC.timer = setTimeout(async () => {
+    const b = vpcBody();
+    if (!b.coordinator) { $("#vpcCmd").textContent = "Connect a console first."; return; }
+    try {
+      const r = await api("POST", "/api/vperfcheck/preview", b);
+      $("#vpcCmd").classList.remove("err");
+      $("#vpcCmd").textContent = r.command;
+      const last = r.last_target;
+      if ($("#vpcPrep").value === "keep" && last && last !== r.target) $("#vpcPrepHint").innerHTML = `<span class="warn">the last dataset is on ${esc(last)} - choose Auto size for a new target</span>`;
+    } catch (e) { $("#vpcCmd").classList.add("err"); $("#vpcCmd").textContent = e.message; }
+  }, 250);
+}
+// edits stay on screen until 💾 Save (Close asks before dropping them)
+function vpcDirty(on = true) {
+  VPC.dirty = on;
+  const st = $("#vpcSaved");
+  if (on) { st.textContent = "unsaved changes"; st.className = "small warnc"; }
+  else { const at = store.get("vpc:savedAt"); st.textContent = at ? `saved ${new Date(at).toLocaleString()}` : ""; st.className = "small muted"; }
+}
+$("#vpcForm").addEventListener("input", (e) => {
+  if (e.target.id === "vpcPrep") vpcPrepUi(); vpcKeysNote(); vpcPreview();
+  if (!["vpcAk", "vpcSk"].includes(e.target.id)) vpcDirty();     // typed keys are never saved
+});
+// the S3 keys note follows a typed key pair (used for this run only)
+function vpcKeysNote() {
+  const n = $("#vpcKeysNote");
+  if (!n) return;
+  if (!n.dataset.text) n.dataset.text = n.textContent;
+  const typed = vpcVal("vpcAk") && vpcVal("vpcSk");
+  n.textContent = typed ? "the typed key pair is used (this run only, never saved)" : n.dataset.text;
+  n.className = `small ${typed || n.dataset.base ? "muted" : "err"}`;
+}
+$("#vpcForm").addEventListener("change", async (e) => {
+  if (e.target.id === "vpcPrep") vpcPrepUi();
+  if (!["vpcAk", "vpcSk"].includes(e.target.id)) vpcDirty();
+  if (e.target.id === "vpcCoord") await vpcRefreshInfo();
+  vpcPreview();
+});
+$("#vpcForm").addEventListener("click", (e) => {
+  const m = e.target.closest("[data-vmode]");
+  if (!m || m.dataset.vmode === VPC.mode) return;
+  VPC.mode = m.dataset.vmode; vpcDirty();
+  // profiles and the dataset choice differ per target type: they come from that type's saved values
+  const keep = vpcSnapshot(); vpcBuild(); vpcRestore(Object.fromEntries(Object.entries(keep).filter(([k]) => !["vpcPrep", "_profs"].includes(k))));
+});
+
+// streamed step lists (pre-check, SSH trust)
+const VPC_ICON = { running: '<span class="vpc-spin" aria-label="running"></span>', ok: '<span class="pk-ok">✓</span>', failed: '<span class="pk-miss">✗</span>', warn: '<span class="pk-upd">!</span>' };
+async function vpcSteps(url, body, title, box = $("#vpcSteps")) {
+  box.innerHTML = `<div class="vpc-st-head"><b>${esc(title)}</b> <span class="muted small" id="vpcStMeta"></span></div><ol class="vpc-st"></ol><div class="vpc-st-end small"></div>`;
+  const list = $(".vpc-st", box), rows = {};
+  let ok = null;
+  try {
+    await streamNdjson(url, body, (ev) => {
+      if (ev.t === "start") $("#vpcStMeta", box).textContent = `coordinator ${ev.coordinator}${ev.hosts ? ` → ${ev.hosts.join(", ")}` : ""}`;
+      if (ev.t === "step") {
+        let li = rows[ev.step];
+        if (!li) { li = rows[ev.step] = document.createElement("li"); li.innerHTML = '<span class="vpc-ic"></span><div><div class="vpc-lb"></div><div class="vpc-dt small muted"></div></div>'; list.appendChild(li); }
+        li.className = `vpc-${ev.status}`;
+        $(".vpc-ic", li).innerHTML = VPC_ICON[ev.status] || "";
+        if (ev.label) $(".vpc-lb", li).textContent = ev.label;
+        if (ev.detail !== undefined) $(".vpc-dt", li).textContent = ev.detail;
+      }
+      if (ev.t === "done") ok = ev.ok;
+    });
+  } catch (e) { $(".vpc-st-end", box).innerHTML = `<span class="err">${esc(e.message)}</span>`; return false; }
+  box.scrollIntoView?.({ block: "nearest" });
+  $(".vpc-st-end", box).innerHTML = ok ? '<span class="pk-ok">✓ All good</span>' : '<span class="pk-miss">✗ Something needs attention - see the steps above</span>';
+  return ok;
+}
+const vpcPick = () => { const b = vpcBody(); if (!b.coordinator) throw new Error("Connect a console first"); return b; };
+const vpcCoordName = () => $("#vpcCoord")?.selectedOptions[0]?.dataset.name || "the coordinator";
+const vpcHostNames = () => $$(".vpc-host:checked").map((i) => i.dataset.name);
+
+/* -- windows: Configure vperfcheck (#vpcModal) and the steps of a Vast menu action (#vpcStepsModal) -- */
+// Esc / ✕ / a click outside close the window on top; a confirm dialog opened over it closes first
+const vpcTop = (el) => { const open = $$(".modal-backdrop").filter((x) => !x.hidden && x.isConnected); return open[open.length - 1] === el; };
+async function vpcOpen() {
+  if (!VPC.built) await vpcInit();
+  if (!VPC.built) return alert("Connect a console first");
+  await vpcRefreshInfo();
+  vpcDirty(VPC.dirty);
+  $("#vpcModal").hidden = false;
+  vpcPreview();
+  $("#vpcModalX").focus();
+}
+async function vpcClose() {
+  if (VPC.dirty) {
+    const ok = await uiConfirm({ title: "Discard the changes?", ok: "Discard", cancel: "Keep editing", danger: true,
+      html: "<p>The vperfcheck settings were changed but not saved. Close and go back to the saved settings?</p>" });
+    if (!ok) return;
+    VPC.mode = store.get("vpc:mode") || "file";
+    $("#vpcForm").innerHTML = ""; vpcBuild(); vpcDirty(false);     // rebuilt from the saved values
+    await vpcRefreshInfo();
+  }
+  $("#vpcModal").hidden = true;
+}
+$("#vpcModalX").onclick = vpcClose;
+$("#vpcClose").onclick = vpcClose;
+$("#vpcModal").addEventListener("mousedown", (e) => { if (e.target === e.currentTarget) vpcClose(); });
+function vpcStepsOpen(title) {
+  $("#vpcStepsTitle").textContent = title;
+  $("#vpcStepsModal").hidden = false;
+  $("#vpcStepsX").focus();
+  return $("#vpcStepsBox");
+}
+const vpcStepsClose = () => { $("#vpcStepsModal").hidden = true; };
+$("#vpcStepsX").onclick = vpcStepsClose;
+$("#vpcStepsModal").addEventListener("mousedown", (e) => { if (e.target === e.currentTarget) vpcStepsClose(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if (!$("#vpcStepsModal").hidden && vpcTop($("#vpcStepsModal"))) vpcStepsClose();
+  else if (!$("#vpcModal").hidden && vpcTop($("#vpcModal"))) vpcClose();
+});
+
+/* -- 💾 Save: this browser, the site (.vperfcheck-state.json) and a log entry in 🗒 Logs -- */
+async function vpcSaveConfig({ log = true } = {}) {
+  vpcSave();
+  const form = {};
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k.startsWith("vpc:") && k !== "vpc:savedAt") form[k] = store.get(k);
+  }
+  let run = null;
+  try { run = vpcBody(); delete run.s3_access_key; delete run.s3_secret_key; if (!run.coordinator) run = null; } catch { run = null; }
+  const r = await api("POST", "/api/vperfcheck/config", { form, run, log });
+  store.set("vpc:savedAt", r.saved_at);
+  vpcDirty(false);
+  if (log) $("#vpcSaved").textContent += " · logged in 🗒 Logs";
+  return r;
+}
+$("#vpcSaveBtn").onclick = (e) => busy(e.target, () => vpcSaveConfig());
+
+/* -- actions -- */
+$("#vpcPrecheck").onclick = (e) => busy(e.target, async () => { await vpcSteps("/api/vperfcheck/precheck", vpcPick(), "Pre-check"); await vpcRefreshInfo(); });
+async function vpcStart(dry) {
+  const b = vpcPick();
+  if (!b.hosts.length) throw new Error("Tick at least one benchmark client");
+  if (!dry) {
+    const prep = { auto: "auto-size the dataset first", keep: "use the existing dataset", size: `lay out ${b.prep_size || "?"} first` }[b.prep_mode];
+    if (!(await uiConfirm({ title: "Run vperfcheck?", ok: "Run", html: `<p>${esc(vpcCoordName())} runs vperfcheck on <b>${esc(vpcHostNames().join(", "))}</b>
+      against <code>${esc(VPC.mode === "s3" ? "S3" : (vpcVal("vpcDir") || VPC.info?.settings?.dir || ""))}</code>: ${esc(prep)}, then ${esc(b.tests.join(", ") || "the default profiles")}.</p>
+      <p class="muted small">This writes test data to the VAST cluster. The coordinator's console shows the progress; ■ Stop (here or in Presets → Vast) ends it.</p>` }))) return;
+  }
+  if (VPC.dirty) await vpcSaveConfig({ log: false });   // a run uses what is on screen: keep it as the saved settings
+  const { run_id } = await api("POST", "/api/vperfcheck/run", { ...b, dryrun: dry });
+  VPC.runId = run_id; vpcRunUi();
+  $("#vpcModal").hidden = true;          // the coordinator's console shows the progress
+  toast(`vperfcheck${dry ? " (dry run)" : ""} started on ${vpcCoordName()} - its console shows the progress.`, "ok", 5000);
+  trackRun(run_id, dry ? "vperfcheck (dry run)" : "vperfcheck", (run) => {
+    VPC.runId = null; vpcRunUi();
+    const n = (run.summary || []).length;
+    const msg = dry ? "vperfcheck dry run done - the commands it would run are in the coordinator's console."
+      : n ? `vperfcheck: ${n} result${n === 1 ? "" : "s"} - see Performance results and 🗒 Logs (json, txt and csv).`
+        : `vperfcheck: no results came back${run.status === "failed" ? " (the run failed - see the coordinator's console or 🗒 Logs)" : ""}.`;
+    $("#vpcSteps").innerHTML = `<div class="small">${dry || n ? '<span class="pk-ok">✓</span>' : '<span class="pk-miss">✗</span>'} ${esc(msg)}</div>`;
+    toast(msg, dry || n ? "ok" : "err", 9000);
+    if (n) { perfRun = run; renderSummary(run); }
+  });
+}
+// ■ Stop shows while a run is going: in the window and in Presets → Vast
+function vpcRunUi() {
+  $("#vpcStop").hidden = !VPC.runId;
+  $$('[data-vpcact="stop"]').forEach((x) => { x.hidden = !VPC.runId; });
+}
+async function vpcStop() {
+  if (!(await uiConfirm({ title: "Stop vperfcheck?", ok: "Stop", danger: true, html: "Stops vperfcheck on the coordinator and the elbencho services on the benchmark clients." }))) return;
+  const b = vpcPick(); await api("POST", "/api/vperfcheck/stop", { coordinator: b.coordinator, hosts: b.hosts });
+}
+$("#vpcRun").onclick = (e) => busy(e.target, () => vpcStart(false));
+$("#vpcDry").onclick = (e) => busy(e.target, () => vpcStart(true));
+$("#vpcStop").onclick = (e) => busy(e.target, vpcStop);
+
+// Presets → Vast: these use the saved settings (coordinator and ticked clients); the steps show in their own window
+async function vpcMenu(act, menuBtn) {
+  closePresetMenus();
+  if (act === "configure") return vpcOpen().catch((e) => alert(e.message));
+  if (!VPC.built) await vpcInit();
+  if (!VPC.built) return alert("Connect a console first");
+  const run = (fn) => busy(menuBtn, fn);
+  const steps = (url, body, title) => vpcSteps(url, body, title, vpcStepsOpen(title));
+  if (act === "stop") return run(vpcStop);
+  if (act === "install") return run(async () => {
+    const b = vpcPick();
+    const { run_id } = await api("POST", "/api/vperfcheck/install", { coordinator: b.coordinator });
+    toast(`Installing vperfcheck from ${vpcCoordName()} onto the shared VAST view - its console shows the progress.`, "ok", 5000);
+    trackRun(run_id, "Install vperfcheck", async () => {
+      await vpcRefreshInfo();
+      const v = VPC.info?.state?.version;
+      toast(v ? `vperfcheck ${v} is installed.` : "Install vperfcheck finished - see the coordinator's console.", v ? "ok" : "err", 7000);
+    });
+  });
+  if (act === "trusttest") return run(() => {
+    const b = vpcPick();
+    return steps("/api/vperfcheck/trust", { coordinator: b.coordinator, hosts: b.hosts, action: "test" }, "SSH from the coordinator to each client");
+  });
+  if (act === "trust") {
+    const b = vpcPick(), coord = vpcCoordName(), names = vpcHostNames();
+    if (!b.hosts.length) return alert("No benchmark client is ticked - tick them in Configure vperfcheck");
+    if (!(await uiConfirm({ title: "Set up SSH trust?", ok: "Set up", wide: true, html: `
+      <p><b>${esc(coord)}</b> (the coordinator) will be able to log in to <b>${esc(names.join(", "))}</b> without a password, as vperfcheck needs.</p>
+      <ul class="small"><li>On ${esc(coord)}: a new key <code>~/.ssh/vast_test_bench_vperfcheck</code> (your existing keys are not touched) and a marked block at the top of <code>~/.ssh/config</code> for these hosts only (that key, accept a new host key; a changed one is still refused). A backup of the config is kept.</li>
+      <li>On each client: that public key is added once to <code>~/.ssh/authorized_keys</code>. Nothing is removed and the SSH server is not changed, so the logins you use today keep working.</li>
+      <li><b>Remove SSH trust</b> takes all of it out again.</li></ul>
+      <p class="muted small">The coordinator and clients come from Configure vperfcheck.</p>` }))) return;
+    return run(() => steps("/api/vperfcheck/trust", { coordinator: b.coordinator, hosts: b.hosts, action: "setup" }, "Set up SSH trust"));
+  }
+  if (act === "trustremove") {
+    const b = vpcPick(), coord = vpcCoordName(), names = vpcHostNames();
+    if (!(await uiConfirm({ title: "Remove SSH trust?", ok: "Remove", danger: true, html: `<p>Removes the app's key from <code>~/.ssh/authorized_keys</code> on <b>${esc(names.join(", ") || "no client")}</b>, and the key and the marked <code>~/.ssh/config</code> block on ${esc(coord)} once no client is left in it. Other keys and settings stay.</p>` }))) return;
+    return run(() => steps("/api/vperfcheck/trust", { coordinator: b.coordinator, hosts: b.hosts, action: "remove" }, "Remove SSH trust"));
+  }
+  if (act === "package") return run(async () => {
+    const b = vpcPick();
+    toast(`Packaging the vperfcheck results on ${vpcCoordName()}…`, "ok", 4000);
+    const r = await fetch("/api/vperfcheck/package", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ coordinator: b.coordinator }) });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `HTTP ${r.status}`);
+    const name = (r.headers.get("content-disposition") || "").match(/filename="?([^";]+)/)?.[1] || "vperfcheck-package.tar.gz";
+    const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(await r.blob()), download: name });
+    document.body.appendChild(a); a.click(); a.remove();
+  });
+}

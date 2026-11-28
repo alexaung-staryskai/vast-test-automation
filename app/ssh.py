@@ -70,6 +70,7 @@ class Session:
         self.waiting: str | None = None
         self.term_size = (120, 32)
         self.sudo_nopasswd: bool | None = None
+        self.extra_secrets: set[str] = set()   # also masked in this console (e.g. the S3 secret during vperfcheck)
         self.selected = True         # ticked for preset runs (restored after a page reload)
         self.origin: str | None = None  # name of the saved client it was opened from, if any
         self.last_seen = time.monotonic()  # last time a page was attached (for the idle auto-close)
@@ -232,8 +233,10 @@ class Session:
         await self.send({"type": "waiting", "prompt": prompt})
 
     def mask(self, text: str) -> str:
-        pw = self.client.get("password") or ""
-        return text.replace(pw, "********") if len(pw) >= 3 else text
+        for secret in [self.client.get("password") or "", *getattr(self, "extra_secrets", ())]:
+            if len(secret) >= 3:
+                text = text.replace(secret, "********")
+        return text
 
     async def close(self) -> None:
         self.status = "closed"
@@ -343,7 +346,7 @@ class SessionManager:
             "settings": {
                 "delay_between_commands_seconds": group.get(
                     "delay_between_commands_seconds", ex.get("delay_between_commands_seconds", 0)),
-                "command_timeout_seconds": ex.get("command_timeout_seconds", 3600),
+                "command_timeout_seconds": group.get("command_timeout_seconds", ex.get("command_timeout_seconds", 3600)),
                 "stop_on_error": ex.get("stop_on_error", True),
                 "parallel_clients": ex.get("parallel_clients", True),
                 "use_pty": ex.get("use_pty", True),
@@ -372,6 +375,8 @@ class SessionManager:
                     run["clients"].append(await self._safe_client(run, group, s, ctxs[s.id]))
             if group.get("results"):
                 run["summary"] = elbencho.aggregate(run["clients"])
+            if group.get("post"):   # e.g. vperfcheck: fetch its result files from the coordinator
+                await group["post"](run)
             run["status"] = "done" if all(c["status"] == "ok" for c in run["clients"]) else "failed"
         except Exception as e:  # noqa: BLE001
             run["status"] = "failed"
@@ -454,7 +459,8 @@ class SessionManager:
                 rec["status"] = "failed"
                 await s.emit(f"{RED}✖ {msg}{RESET}\r\n")
                 break
-            c = await self._exec(run, s, cmd, display, idx, len(cmds), use_sudo)
+            item_sudo = use_sudo and not (isinstance(item, dict) and item.get("sudo") is False)
+            c = await self._exec(run, s, cmd, display, idx, len(cmds), item_sudo)
             if group.get("results"):
                 c["elbencho"] = elbencho.parse(c["output"])
             rec["commands"].append(c)
@@ -465,6 +471,7 @@ class SessionManager:
                     break
         if group.get("parse") == "packages" and rec["commands"]:
             rec["packages"] = packages.parse_check(rec["commands"][0]["output"], group["pkg_cfg"])
+            rec["packages"]["checked_at"] = now_iso()
             self.pkg_status[s.id] = rec["packages"]
         await s.emit(f"{GREEN if rec['status'] == 'ok' else RED}━━ {run['label']}: {rec['status'].upper()} ━━{RESET}\r\n")
         if s.shell:

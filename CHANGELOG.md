@@ -4,6 +4,36 @@ The app's version is in [`VERSION`](VERSION) and shows next to the title in the 
 Bump it with every change you push: **major** for changes that break existing sites or configs,
 **minor** for new features, **patch** for fixes and docs.
 
+## 1.6.0
+- **vperfcheck** (tab ②, **Presets → Vast**): VAST's profile-driven elbencho wrapper, run from one client (the
+  coordinator) against all the ticked clients together, for the file system and S3.
+  - **⚙ Configure vperfcheck** window with all the settings, the command line, Pre-check / Dry run / Run / Stop, and
+    **💾 Save**: kept in the browser and on the site, and logged in 🗒 Logs (`vperfcheck-config`, with the command line).
+    Closing with unsaved changes asks first.
+  - **⤓ Export configuration / ⤒ Import site** carry the saved vperfcheck settings (not the lab's run state or any
+    S3 key). The browser takes the open site's saved settings, so switching or importing a site no longer shows the
+    previous site's vperfcheck settings.
+  - **⤓ Install / update** onto the shared VAST view; **✓ Pre-check** of everything it needs.
+  - **🔑 Set up SSH trust** from the coordinator to the clients (dedicated key, marked `~/.ssh/config` block; existing
+    keys, settings and password logins are kept), **🔌 Test SSH between clients**, **Remove SSH trust**.
+  - **▶ Run / Dry run / ■ Stop** with the dataset (auto / existing / fixed size), profiles, time, threads, loop,
+    latency and advanced options; the command line is shown first. The elbencho services are stopped after every run.
+  - **S3**: the keys onboarding created (or a typed pair, used once), the tenant VIP pool as endpoints, the view's bucket.
+    The secret is masked in the console and never logged.
+  - Results (one row per profile, with latency percentiles) in Performance results, 🗒 Logs (json / txt / csv), Chart
+    and the PowerPoint / Word reports. **📦 Package results** downloads vperfcheck's package.
+  - Guards for vperfcheck 2026-10-02's limits: "use the existing dataset" only for the target it laid out last, Auto
+    size for the first run on an empty S3 prefix, a warning when clients log in as different users.
+- **Packages moved into Presets → Client Cmds** (the Required packages section is gone): Check packages, Show last
+  check, Install missing, Update packages, and the config's `section: packages` presets (Check VAST driver version).
+  - The results open in a **window** when a check finishes (Esc / ✕ closes it; Show last check opens it again). Its
+    Install / Reinstall / Uninstall buttons close it so the consoles stay visible, and it opens again after the re-check.
+  - The run log (🗒 Logs, `.txt`) now has a readable **PACKAGES** table per client (ok / MISSING, version, updates).
+- New config section `vperfcheck:`; `jq` added to `packages.system` and `aws-cli` (AWS CLI v2) to Required packages.
+- **Tester manual** (`VAST Test Bench - Tester Manual.pptx`) updated for 1.5 and 1.6: Disconnect all, Client Cmds →
+  Packages and the Required packages window, the Vast menu, Configure vperfcheck, SSH trust, the vperfcheck flow,
+  export of the vperfcheck settings and two new troubleshooting rows (44 slides).
+
 ## 1.5.0
 - **`packages.system`** in the config: a plain list of OS packages (e.g. `curl`, `numactl`, `sysstat`, `ethtool`,
   `pciutils`) to check and install on the clients. Each is checked in the client's package database (`dpkg-query` /

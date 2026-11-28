@@ -447,9 +447,14 @@ tr.step-queued td { opacity: .6; }
 .pmenu-item:hover, .pmenu-item:focus-visible { background: var(--accent); color: var(--accent-text); outline: none; }
 .pmenu-item.danger { color: var(--bad); }
 .pmenu-item.danger:hover, .pmenu-item.danger:focus-visible { background: var(--bad); color: #fff; }
+.pmenu-sep { margin: 4px 6px 2px; padding: 6px 4px 2px; border-top: 1px solid var(--border);
+  font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.pmenu-sep:first-child { border-top: 0; margin-top: 0; }
+.pkg-modal { width: min(1400px, 96vw); max-height: calc(100vh - 32px); }
+.pkg-modal .pkg-body { overflow: auto; }
 .pmenu-empty { padding: 8px 10px; font-size: 12px; color: var(--muted); white-space: normal; max-width: 280px; }
 
-/* collapsible cards (Required packages, Presets): folded = title bar only */
+/* collapsible cards (Presets, vperfcheck): folded = title bar only */
 .collapse-toggle { background: none; border: 0; padding: 0; margin: 0; font: inherit; color: inherit; cursor: pointer;
   display: inline-flex; align-items: center; gap: 6px; border-radius: 6px; }
 .collapse-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
@@ -820,3 +825,37 @@ input.masked:placeholder-shown { -webkit-text-security: none; text-security: non
 #rtStatus { margin: 4px 0 6px; }
 .rt-help ul { margin: 6px 0 0; padding-left: 18px; } .rt-help li { margin: 3px 0; }
 .pr-formats { gap: 14px; flex-wrap: wrap; }
+
+/* ---- vperfcheck card ---- */
+.vpc-intro { margin: 2px 0 10px; }
+.vpc-form { display: grid; gap: 8px; }
+.vpc-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.vpc-l { width: 140px; color: var(--muted); font-size: 12.5px; flex: none; }
+.vpc-hosts, .vpc-profs { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.vpc-chk { display: inline-flex; gap: 5px; align-items: center; font-size: 13px; }
+.vpc-wide { min-width: 320px; flex: 1; }
+.vpc-short { width: 80px; }
+.vpc-adv summary { cursor: pointer; color: var(--muted); margin-left: 148px; }
+.vpc-advrow { margin: 8px 0 0 148px; }
+.vpc-cmdwrap { margin-top: 10px; }
+.vpc-cmd { background: var(--code-bg); border-radius: 8px; padding: 8px 10px; font-size: 12px; white-space: pre-wrap; word-break: break-all; margin: 4px 0 8px; }
+.vpc-cmd.err { color: var(--bad); }
+.vpc-steps { margin-top: 8px; }
+.vpc-st { list-style: none; padding: 0; margin: 6px 0; display: grid; gap: 6px; }
+.vpc-st li { display: flex; gap: 10px; align-items: flex-start; }
+.vpc-st li .vpc-ic { width: 18px; text-align: center; flex: none; }
+.vpc-st li.vpc-failed .vpc-lb { color: var(--bad); }
+.vpc-dt { overflow-wrap: anywhere; white-space: pre-wrap; }
+.vpc-spin { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: vpcSpin .8s linear infinite; }
+@keyframes vpcSpin { to { transform: rotate(360deg); } }
+@media (max-width: 760px) { .vpc-l { width: 100%; } .vpc-adv summary, .vpc-advrow { margin-left: 0; } .vpc-wide { min-width: 0; } }
+.vpc-form .warn, .vpc-row .warn { color: var(--warn); }
+#vpcVersion { text-transform: none; font-weight: 500; }
+/* vperfcheck windows (Presets → Vast) */
+.vpc-modal { width: min(1200px, 96vw); max-height: calc(100vh - 32px); }
+.vpc-steps-modal { width: min(760px, 96vw); max-height: calc(100vh - 32px); }
+.vpc-modal .vpc-actions { align-items: center; flex-wrap: wrap; justify-content: flex-start; }
+.vpc-gap { flex: 1; }
+#vpcTitle .pill { margin-left: 6px; vertical-align: 2px; }
+.pmenu-item.pi-ic::before { content: none; }
+.pmenu-item .pi { display: inline-block; width: 20px; margin-right: 6px; text-align: center; }
